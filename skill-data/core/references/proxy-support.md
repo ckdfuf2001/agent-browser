@@ -207,6 +207,17 @@ agent-browser --ca-cert /etc/pki/ca-trust/source/anchors/proxy-ca.pem --cdp wss:
 
 Neither disables verification. Without one of them the CLI keeps using the built-in roots, so nothing changes for setups that work today. `agent-browser doctor` reports which trust store is active.
 
+Which one to reach for depends on where the CA already lives, and that differs by platform:
+
+| Platform | Where a proxy CA usually lives | Use |
+| --- | --- | --- |
+| Linux, containers, Vercel Sandbox | a PEM bundle, with `SSL_CERT_FILE` already pointing at it | nothing; it is picked up. Otherwise `--ca-cert <path>` |
+| macOS | the Keychain, installed by MDM. There is no `SSL_CERT_FILE` by default | `--use-system-ca` |
+| Windows | the Windows certificate store | `--use-system-ca` |
+| Any, when you have the certificate as a file | wherever you saved it | `--ca-cert <path>` |
+
+`--ca-cert` takes a path, so it cannot reach a CA that lives only in the macOS Keychain or the Windows certificate store. That is what `--use-system-ca` is for. On Linux the two overlap, because the system store is a file there.
+
 ### Vercel Sandbox
 
 A Vercel Sandbox network policy that rewrites requests terminates TLS and re-signs with the Vercel proxy CA, which the sandbox already installs. Set `AGENT_BROWSER_USE_SYSTEM_CA=1` in the sandbox so the CLI picks it up.
