@@ -211,14 +211,24 @@ pub fn apply_to_reqwest(builder: reqwest::ClientBuilder) -> reqwest::ClientBuild
     builder
 }
 
-/// A `reqwest` client that honors the configured trust store.
+/// A shared `reqwest` client that honors the configured trust store.
+///
+/// Built once and cloned, which is cheap: `reqwest::Client` is a handle around
+/// a shared pool. Constructing one per call would rebuild the TLS config and
+/// the connection pool on every request, and CDP discovery calls this twice per
+/// iteration of a retry loop.
 ///
 /// Falls back to a default client if the builder cannot be constructed, so a
 /// bad CA path degrades to the previous behavior instead of killing the command.
 pub fn http_client() -> reqwest::Client {
-    apply_to_reqwest(reqwest::Client::builder())
-        .build()
-        .unwrap_or_default()
+    static CACHED: OnceLock<reqwest::Client> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            apply_to_reqwest(reqwest::Client::builder())
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
 }
 
 fn load_native_der() -> Vec<Vec<u8>> {
