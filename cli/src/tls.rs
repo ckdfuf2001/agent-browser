@@ -30,6 +30,15 @@ pub struct TrustOptions {
     pub use_system_ca: bool,
     /// Extra PEM bundle to trust on top of the selected roots.
     pub ca_cert: Option<String>,
+    /// Whether `ca_cert` came from `SSL_CERT_FILE` rather than from the flag or
+    /// `AGENT_BROWSER_CA_CERT`.
+    ///
+    /// `SSL_CERT_FILE` is ambient: the operator did not ask agent-browser for
+    /// anything, and a stale value is common. An unusable bundle from that
+    /// source degrades to the built-in roots with a warning. An unusable bundle
+    /// the operator named explicitly is an error, because silently ignoring it
+    /// would verify against roots they did not choose.
+    pub ca_cert_is_implicit: bool,
 }
 
 impl TrustOptions {
@@ -45,17 +54,17 @@ impl TrustOptions {
     /// forwards both variables.
     pub fn from_env() -> Self {
         let use_system_ca = crate::flags::env_var_is_truthy("AGENT_BROWSER_USE_SYSTEM_CA");
-        let ca_cert = std::env::var("AGENT_BROWSER_CA_CERT")
+        let explicit = std::env::var("AGENT_BROWSER_CA_CERT")
             .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::env::var("SSL_CERT_FILE")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            });
+            .filter(|s| !s.is_empty());
+        let implicit = std::env::var("SSL_CERT_FILE")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let ca_cert_is_implicit = explicit.is_none() && implicit.is_some();
         Self {
             use_system_ca,
-            ca_cert,
+            ca_cert: explicit.or(implicit),
+            ca_cert_is_implicit,
         }
     }
 }
@@ -88,9 +97,21 @@ pub fn build_root_store(opts: &TrustOptions) -> Result<RootCertStore, String> {
     }
 
     if let Some(path) = &opts.ca_cert {
-        let added = add_pem_bundle(&mut store, path)?;
-        if added == 0 {
-            return Err(format!("No certificates found in CA bundle '{path}'"));
+        let outcome = add_pem_bundle(&mut store, path).and_then(|added| {
+            if added == 0 {
+                Err(format!("No certificates found in CA bundle '{path}'"))
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = outcome {
+            if !opts.ca_cert_is_implicit {
+                return Err(e);
+            }
+            // SSL_CERT_FILE was not aimed at agent-browser. Warn and keep the
+            // roots we already have rather than failing every connection,
+            // including local ws:// ones that never negotiate TLS.
+            eprintln!("agent-browser: ignoring SSL_CERT_FILE: {e}");
         }
     }
 
@@ -209,6 +230,10 @@ fn load_native_der() -> Vec<Vec<u8>> {
 }
 
 /// One-line description of the active trust store, for `agent-browser doctor`.
+///
+/// Reports what is actually in force. A CA bundle that could not be read is
+/// named as ignored rather than listed as trusted, since the whole point of the
+/// line is to tell someone debugging a proxy which roots they really have.
 pub fn describe() -> String {
     let opts = TrustOptions::from_env();
     let roots = if opts.use_system_ca {
@@ -216,9 +241,14 @@ pub fn describe() -> String {
     } else {
         "built-in Mozilla roots"
     };
-    match &opts.ca_cert {
-        Some(path) => format!("{roots} plus CA bundle {path}"),
-        None => roots.to_string(),
+    let Some(path) = &opts.ca_cert else {
+        return roots.to_string();
+    };
+    let mut probe = RootCertStore::empty();
+    match add_pem_bundle(&mut probe, path) {
+        Ok(n) if n > 0 => format!("{roots} plus {n} certificate(s) from {path}"),
+        Ok(_) => format!("{roots} ({path} holds no certificates, ignored)"),
+        Err(_) => format!("{roots} ({path} unreadable, ignored)"),
     }
 }
 
@@ -272,6 +302,7 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
         let opts = TrustOptions {
             use_system_ca: false,
             ca_cert: Some(path.to_string_lossy().into_owned()),
+            ca_cert_is_implicit: false,
         };
         let store = build_root_store(&opts).unwrap();
         assert_eq!(store.len(), webpki_roots::TLS_SERVER_ROOTS.len() + 1);
@@ -286,6 +317,7 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
         let opts = TrustOptions {
             use_system_ca: false,
             ca_cert: Some(path.to_string_lossy().into_owned()),
+            ca_cert_is_implicit: false,
         };
         let store = build_root_store(&opts).unwrap();
         // rustls deduplicates identical anchors, so the count grows by one.
@@ -299,6 +331,7 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
         let opts = TrustOptions {
             use_system_ca: false,
             ca_cert: Some("/nonexistent/ca.pem".to_string()),
+            ca_cert_is_implicit: false,
         };
         let err = build_root_store(&opts).unwrap_err();
         assert!(err.contains("Failed to read"), "{err}");
@@ -310,9 +343,36 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
         let opts = TrustOptions {
             use_system_ca: false,
             ca_cert: Some(path.to_string_lossy().into_owned()),
+            ca_cert_is_implicit: false,
         };
         let err = build_root_store(&opts).unwrap_err();
         assert!(err.contains("No certificates found"), "{err}");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_unusable_bundle_from_ssl_cert_file_degrades_instead_of_failing() {
+        // SSL_CERT_FILE is ambient. A stale value must not take down every
+        // connection, including local ws:// ones that never negotiate TLS.
+        let opts = TrustOptions {
+            use_system_ca: false,
+            ca_cert: Some("/nonexistent/ca.pem".to_string()),
+            ca_cert_is_implicit: true,
+        };
+        let store = build_root_store(&opts).expect("implicit source must not be fatal");
+        assert_eq!(store.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+    }
+
+    #[test]
+    fn an_empty_bundle_from_ssl_cert_file_also_degrades() {
+        let path = write_temp_pem("not a certificate\n");
+        let opts = TrustOptions {
+            use_system_ca: false,
+            ca_cert: Some(path.to_string_lossy().into_owned()),
+            ca_cert_is_implicit: true,
+        };
+        assert!(build_root_store(&opts).is_ok());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -322,6 +382,7 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
         let opts = TrustOptions {
             use_system_ca: true,
             ca_cert: None,
+            ca_cert_is_implicit: false,
         };
         let store = build_root_store(&opts).unwrap();
         assert!(
