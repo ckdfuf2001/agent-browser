@@ -20,7 +20,6 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 
 /// Which roots the CLI verifies against.
@@ -124,28 +123,13 @@ fn add_webpki_roots(store: &mut RootCertStore) {
 
 /// Add every certificate in a CA file to the store. Returns how many were added.
 ///
-/// Accepts PEM and raw DER, the same two encodings the browser-side SPKI hash
-/// accepts. The flag is shared between the two, so a file that works for
-/// Chromium has to work here: a Windows-exported `.cer` is DER, and rejecting
-/// it on one side only would mean the browser trusts the proxy while the CLI
-/// refuses to start.
+/// Reading and validating belongs to `ca_bundle`, which the Chromium SPKI path
+/// uses too. One loader is the point: when this module had its own, the same
+/// `--ca-cert` file was valid for one consumer and invalid for the other.
 fn add_ca_bundle(store: &mut RootCertStore, path: &str) -> Result<usize, String> {
-    let data =
-        std::fs::read(path).map_err(|e| format!("Failed to read CA certificate '{path}': {e}"))?;
-
-    if !data.starts_with(b"-----BEGIN") {
-        let cert = CertificateDer::from(data);
-        store.add(cert).map_err(|e| {
-            format!("'{path}' is not a PEM bundle and not a valid DER certificate: {e}")
-        })?;
-        return Ok(1);
-    }
-
-    let mut reader = std::io::BufReader::new(data.as_slice());
+    let certs = crate::ca_bundle::load(path)?;
     let mut added = 0;
-    for cert in rustls_pemfile::certs(&mut reader) {
-        let cert: CertificateDer<'_> =
-            cert.map_err(|e| format!("Failed to parse CA certificate '{path}': {e}"))?;
+    for cert in certs {
         store
             .add(cert)
             .map_err(|e| format!("Rejected CA certificate in '{path}': {e}"))?;
@@ -209,17 +193,18 @@ pub fn apply_to_reqwest(builder: reqwest::ClientBuilder) -> reqwest::ClientBuild
         }
     }
 
+    // The same loader the root store and the Chromium SPKI path use. Parsing
+    // the bundle a third way here is how the accepted input domains drift.
     if let Some(path) = &opts.ca_cert {
-        match std::fs::read(path) {
-            Ok(pem) => match reqwest::Certificate::from_pem_bundle(&pem) {
-                Ok(certs) => {
-                    for c in certs {
+        match crate::ca_bundle::load(path) {
+            Ok(certs) => {
+                for der in certs {
+                    if let Ok(c) = reqwest::Certificate::from_der(der.as_ref()) {
                         builder = builder.add_root_certificate(c);
                     }
                 }
-                Err(e) => eprintln!("agent-browser: failed to parse CA bundle '{path}': {e}"),
-            },
-            Err(e) => eprintln!("agent-browser: failed to read CA bundle '{path}': {e}"),
+            }
+            Err(e) => eprintln!("agent-browser: ignoring CA bundle '{path}': {e}"),
         }
     }
 
@@ -255,6 +240,10 @@ fn load_native_der() -> Vec<Vec<u8>> {
 }
 
 /// Warn on this process's stderr when a configured trust source is unusable.
+///
+/// Emitted in `--json` mode too: the line goes to stderr and stdout stays a
+/// single parseable document, so suppressing it would only cost a scripted
+/// caller the one message that names the cause.
 ///
 /// The store is built wherever it is first needed, and for a remote CDP
 /// connection that is the daemon, whose stderr is discarded. A user whose

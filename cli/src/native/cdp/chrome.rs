@@ -381,25 +381,22 @@ struct ChromeArgs {
 }
 
 /// Compute base64-encoded SHA-256 hashes of the SubjectPublicKeyInfo (SPKI)
-/// from a PEM or DER certificate file. Returns a comma-separated list of
-/// hashes when the PEM contains multiple certificates (e.g., a CA bundle).
-/// This is the format Chromium expects for `--ignore-certificate-errors-spki-list`.
+/// from a CA certificate file. Returns a comma-separated list of hashes when
+/// the file holds several certificates. This is the format Chromium expects
+/// for `--ignore-certificate-errors-spki-list`.
+///
+/// Reading and validating the file belongs to `ca_bundle`, so this hashes only
+/// bytes a certificate parser already accepted. That flag suppresses every
+/// certificate error for a chain carrying the listed key, so hashing something
+/// on the strength of its shape would hand Chromium an exception for a key no
+/// trust store would take.
 fn compute_spki_hash(cert_path: &str) -> Result<String, String> {
-    let data = std::fs::read(cert_path)
-        .map_err(|e| format!("Failed to read CA certificate '{}': {}", cert_path, e))?;
-
-    let certs: Vec<Vec<u8>> = if data.starts_with(b"-----BEGIN") {
-        let pem_str = std::str::from_utf8(&data)
-            .map_err(|e| format!("CA certificate is not valid UTF-8: {}", e))?;
-        decode_pem_certificates(pem_str)?
-    } else {
-        vec![data]
-    };
+    let certs = crate::ca_bundle::load(cert_path)?;
 
     let hashes: Vec<String> = certs
         .iter()
         .map(|der| {
-            let spki = extract_spki_from_der(der)?;
+            let spki = extract_spki_from_der(der.as_ref())?;
             let hash = Sha256::digest(spki);
             Ok(base64::engine::general_purpose::STANDARD.encode(hash))
         })
@@ -409,6 +406,11 @@ fn compute_spki_hash(cert_path: &str) -> Result<String, String> {
 }
 
 /// Decode all certificates from a PEM file to DER bytes.
+///
+/// Test-only. Runtime loading goes through `ca_bundle`, which validates; a
+/// second parser on the runtime path is what let the two consumers of
+/// `--ca-cert` drift apart.
+#[cfg(test)]
 fn decode_pem_certificates(pem: &str) -> Result<Vec<Vec<u8>>, String> {
     let mut certs = Vec::new();
     let mut in_cert = false;
@@ -2355,9 +2357,13 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
         )
         .unwrap();
 
+        // The invariant is that a file carrying no certificate produces no
+        // SPKI hash, and that the error names the file. The wording belongs to
+        // `ca_bundle` now, so asserting the old sentence would pin the message
+        // rather than the behavior.
         let result = compute_spki_hash(cert_path.to_str().unwrap());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No certificate found"));
+        let err = result.unwrap_err();
+        assert!(err.contains("empty.crt"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
