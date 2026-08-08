@@ -97,7 +97,7 @@ pub fn build_root_store(opts: &TrustOptions) -> Result<RootCertStore, String> {
     }
 
     if let Some(path) = &opts.ca_cert {
-        let outcome = add_pem_bundle(&mut store, path).and_then(|added| {
+        let outcome = add_ca_bundle(&mut store, path).and_then(|added| {
             if added == 0 {
                 Err(format!("No certificates found in CA bundle '{path}'"))
             } else {
@@ -122,10 +122,25 @@ fn add_webpki_roots(store: &mut RootCertStore) {
     store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 }
 
-/// Add every certificate in a PEM file to the store. Returns how many were added.
-fn add_pem_bundle(store: &mut RootCertStore, path: &str) -> Result<usize, String> {
+/// Add every certificate in a CA file to the store. Returns how many were added.
+///
+/// Accepts PEM and raw DER, the same two encodings the browser-side SPKI hash
+/// accepts. The flag is shared between the two, so a file that works for
+/// Chromium has to work here: a Windows-exported `.cer` is DER, and rejecting
+/// it on one side only would mean the browser trusts the proxy while the CLI
+/// refuses to start.
+fn add_ca_bundle(store: &mut RootCertStore, path: &str) -> Result<usize, String> {
     let data =
         std::fs::read(path).map_err(|e| format!("Failed to read CA certificate '{path}': {e}"))?;
+
+    if !data.starts_with(b"-----BEGIN") {
+        let cert = CertificateDer::from(data);
+        store.add(cert).map_err(|e| {
+            format!("'{path}' is not a PEM bundle and not a valid DER certificate: {e}")
+        })?;
+        return Ok(1);
+    }
+
     let mut reader = std::io::BufReader::new(data.as_slice());
     let mut added = 0;
     for cert in rustls_pemfile::certs(&mut reader) {
@@ -239,6 +254,46 @@ fn load_native_der() -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Warn on this process's stderr when a configured trust source is unusable.
+///
+/// The store is built wherever it is first needed, and for a remote CDP
+/// connection that is the daemon, whose stderr is discarded. A user whose
+/// `SSL_CERT_FILE` is stale would otherwise see only the downstream
+/// `UnknownIssuer` and never the one line that names the cause. The CLI owns
+/// the terminal the user is attached to, so it says it here.
+///
+/// Silent when no trust source is configured, and silent when the configured
+/// one works: this fires only on the rare, actionable case.
+pub fn warn_if_trust_source_unusable() {
+    let opts = TrustOptions::from_env();
+    let Some(path) = &opts.ca_cert else {
+        return;
+    };
+    let mut probe = RootCertStore::empty();
+    let detail = match add_ca_bundle(&mut probe, path) {
+        Ok(n) if n > 0 => return,
+        Ok(_) => format!("no certificates found in '{path}'"),
+        Err(e) => e,
+    };
+    let source = if opts.ca_cert_is_implicit {
+        "SSL_CERT_FILE"
+    } else {
+        "--ca-cert"
+    };
+    eprintln!("{} {source}: {detail}", crate::color::warning_indicator());
+}
+
+/// Describe one CA file the way `describe` would, without reading the environment.
+#[cfg(test)]
+fn describe_path(path: &str) -> String {
+    let mut probe = RootCertStore::empty();
+    match add_ca_bundle(&mut probe, path) {
+        Ok(n) if n > 0 => format!("{n} certificate(s) from {path}"),
+        Ok(_) => format!("{path} holds no certificates"),
+        Err(e) => e,
+    }
+}
+
 /// One-line description of the active trust store, for `agent-browser doctor`.
 ///
 /// Reports what is actually in force. A CA bundle that could not be read is
@@ -255,10 +310,10 @@ pub fn describe() -> String {
         return roots.to_string();
     };
     let mut probe = RootCertStore::empty();
-    match add_pem_bundle(&mut probe, path) {
+    match add_ca_bundle(&mut probe, path) {
         Ok(n) if n > 0 => format!("{roots} plus {n} certificate(s) from {path}"),
         Ok(_) => format!("{roots} ({path} holds no certificates, ignored)"),
-        Err(_) => format!("{roots} ({path} unreadable, ignored)"),
+        Err(_) => format!("{roots} ({path} unusable, ignored)"),
     }
 }
 
@@ -355,10 +410,40 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
             ca_cert: Some(path.to_string_lossy().into_owned()),
             ca_cert_is_implicit: false,
         };
+        // Assert the invariant (the bundle is refused), not the wording: a
+        // non-PEM file is now tried as DER, so the message differs by encoding.
         let err = build_root_store(&opts).unwrap_err();
-        assert!(err.contains("No certificates found"), "{err}");
+        assert!(err.contains(&path.to_string_lossy().to_string()), "{err}");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_der_bundle_is_accepted_like_the_browser_side_accepts_it() {
+        // --ca-cert is shared with the Chromium SPKI path, which reads PEM and
+        // raw DER. A Windows-exported .cer is DER; accepting it on one side
+        // only would trust the proxy in the browser and refuse to start here.
+        let der = {
+            let pem = TEST_PEM.as_bytes();
+            let mut reader = std::io::BufReader::new(pem);
+            let first = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+            first.to_vec()
+        };
+        let dir = std::env::temp_dir().join(format!("ab-tls-der-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ca.der");
+        std::fs::write(&path, &der).unwrap();
+
+        let opts = TrustOptions {
+            use_system_ca: false,
+            ca_cert: Some(path.to_string_lossy().into_owned()),
+            ca_cert_is_implicit: false,
+        };
+        let store = build_root_store(&opts).expect("DER must be accepted");
+        assert_eq!(store.len(), webpki_roots::TLS_SERVER_ROOTS.len() + 1);
+        assert!(describe_path(&path.to_string_lossy()).contains("1 certificate"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

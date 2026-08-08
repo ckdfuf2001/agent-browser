@@ -982,6 +982,9 @@ fn main() {
     if let Some(ref ca) = flags.ca_cert {
         env::set_var("AGENT_BROWSER_CA_CERT", ca);
     }
+    if !flags.json {
+        tls::warn_if_trust_source_unusable();
+    }
     let clean = clean_args(&args);
 
     let has_help = args.iter().any(|a| a == "--help" || a == "-h");

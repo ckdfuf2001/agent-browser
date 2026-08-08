@@ -453,7 +453,7 @@ fn decode_pem_certificate(pem: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Extract the SubjectPublicKeyInfo (SPKI) field from a DER-encoded X.509
-/// certificate.  Uses minimal ASN.1 parsing — just enough to walk the
+/// certificate. Uses minimal ASN.1 parsing, just enough to walk the
 /// top-level SEQUENCE → TBSCertificate → skip version/serial/sigAlg/issuer/
 /// validity → subject → subjectPublicKeyInfo.
 fn extract_spki_from_der(der: &[u8]) -> Result<&[u8], String> {
@@ -464,7 +464,7 @@ fn extract_spki_from_der(der: &[u8]) -> Result<&[u8], String> {
 
     let mut pos = 0;
 
-    // Field 0: version [0] EXPLICIT (optional — present if v2 or v3)
+    // Field 0: version [0] EXPLICIT (optional; present if v2 or v3)
     if pos < tbs.len() && tbs[pos] == 0xA0 {
         let (_, consumed) = read_asn1_element(&tbs[pos..])?;
         pos += consumed;
@@ -490,7 +490,7 @@ fn extract_spki_from_der(der: &[u8]) -> Result<&[u8], String> {
     let (_, consumed) = read_asn1_element(&tbs[pos..])?;
     pos += consumed;
 
-    // Field 6: subjectPublicKeyInfo SEQUENCE — this is the SPKI
+    // Field 6: subjectPublicKeyInfo SEQUENCE, the SPKI
     let (_, consumed) = read_asn1_element(&tbs[pos..])?;
     Ok(&tbs[pos..pos + consumed])
 }
@@ -2422,7 +2422,7 @@ JtnWOCSAT+dNsAXmz4ebm7kp9OnpLLKjvrNEUNPA20J5S+BXTtPv7x/koRwSX35M\n\
         assert_eq!(size, 3);
     }
 
-    /// EC P-256 certificate -- different SPKI structure from RSA.
+    /// EC P-256 certificate, a different SPKI structure from RSA.
     /// Verified against: openssl x509 -pubkey -noout | openssl pkey -pubin -outform der |
     ///                   openssl dgst -sha256 -binary | base64
     #[test]
