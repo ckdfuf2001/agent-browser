@@ -1,3 +1,4 @@
+mod ca_bundle;
 mod chat;
 mod color;
 mod commands;
