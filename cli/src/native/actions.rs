@@ -14,7 +14,7 @@ use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::a11y;
 use super::auth;
-use super::browser::{should_track_target, BrowserManager, WaitUntil};
+use super::browser::{should_track_target, target_in_context, BrowserManager, WaitUntil};
 use super::cdp::chrome::LaunchOptions;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -448,6 +448,12 @@ pub struct DaemonState {
     pub pin_tab: bool,
     /// Last binding written to disk, so persistence is write-on-change.
     last_persisted_binding: Option<tab_binding::TabBinding>,
+    /// In namespace mode, the namespace's single shared Chrome ws_url. Every
+    /// session in the daemon sees the same slot: the first session launches
+    /// Chrome and publishes its ws_url; later sessions connect to it inside
+    /// their own browser context instead of spawning another Chrome tree.
+    /// None outside namespace mode.
+    pub shared_browser: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
 }
 
 fn default_idle_shutdown_is_blocked(
@@ -551,6 +557,7 @@ impl DaemonState {
             confirmed_policy_actions: HashSet::new(),
             pin_tab,
             last_persisted_binding: None,
+            shared_browser: None,
         }
     }
 
@@ -1307,13 +1314,23 @@ impl DaemonState {
         loop {
             match rx.try_recv() {
                 Ok(event) => {
-                    // Target events are not session-scoped; handle them first
+                    // Target events are not session-scoped; handle them first.
+                    // In namespace mode the manager only tracks targets inside
+                    // its own browser context, so sessions sharing one Chrome
+                    // never observe each other's tabs. A None context matches
+                    // everything (the manager is not context-scoped).
+                    let manager_context = self
+                        .browser
+                        .as_ref()
+                        .and_then(|b| b.browser_context_id.clone());
                     match event.method.as_str() {
                         "Target.targetCreated" => {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
                             {
-                                if should_track_target(&te.target_info) {
+                                if should_track_target(&te.target_info)
+                                    && target_in_context(&manager_context, &te.target_info)
+                                {
                                     let already_tracked = self
                                         .browser
                                         .as_ref()
@@ -1330,7 +1347,9 @@ impl DaemonState {
                             if let Ok(te) = serde_json::from_value::<TargetInfoChangedEvent>(
                                 event.params.clone(),
                             ) {
-                                if should_track_target(&te.target_info) {
+                                if should_track_target(&te.target_info)
+                                    && target_in_context(&manager_context, &te.target_info)
+                                {
                                     // If this target is not yet tracked (e.g. it was
                                     // initially filtered because its URL was
                                     // chrome://newtab/), promote it to a new target
@@ -1375,7 +1394,13 @@ impl DaemonState {
                                         attached_iframe_sessions
                                             .push((target_info.target_id, sid.to_string()));
                                     }
-                                    Ok(target_info) if should_track_target(&target_info) => {
+                                    Ok(target_info)
+                                        if should_track_target(&target_info)
+                                            && target_in_context(
+                                                &manager_context,
+                                                &target_info,
+                                            ) =>
+                                    {
                                         attached_page_target_ids
                                             .insert(target_info.target_id.clone());
                                         attached_page_sessions.push((target_info, sid.to_string()));
@@ -3532,7 +3557,32 @@ async fn auto_launch(
         "local",
         None,
     );
-    let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
+
+    // Namespace mode: sessions share the namespace's single Chrome. The first
+    // session launches it and publishes the ws_url; every later session
+    // connects to the running instance inside its own private browser context,
+    // so one Chrome tree serves the whole namespace with per-session isolation.
+    let shared_ws_url = match state.shared_browser {
+        Some(ref shared) => shared.lock().await.clone(),
+        None => None,
+    };
+    let namespace_mode = state.shared_browser.is_some();
+
+    let mgr = if let Some(ws_url) = shared_ws_url {
+        BrowserManager::connect_shared_context(&ws_url).await?
+    } else {
+        let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
+        if namespace_mode {
+            if let Some(ref shared) = state.shared_browser {
+                *shared.lock().await = Some(mgr.ws_url().to_string());
+            }
+            let mut mgr = mgr;
+            mgr.ensure_browser_context().await?;
+            mgr
+        } else {
+            mgr
+        }
+    };
     state.reset_input_state();
     state.browser = Some(mgr);
     state.launch_hash = Some(hash);
@@ -4429,7 +4479,32 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file_from_paths(&state.session_id, launch_options.extensions.as_deref());
     state.reset_input_state();
-    state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
+
+    // Namespace mode: sessions share the namespace's single Chrome. If another
+    // session already launched it, connect to its ws_url inside a fresh private
+    // browser context; otherwise launch a new instance and publish the ws_url
+    // so later sessions reuse it (mirrors auto_launch).
+    let shared_ws_url = match state.shared_browser {
+        Some(ref shared) => shared.lock().await.clone(),
+        None => None,
+    };
+    let namespace_mode = state.shared_browser.is_some();
+    let mgr = if let Some(ws_url) = shared_ws_url {
+        BrowserManager::connect_shared_context(&ws_url).await?
+    } else {
+        let mgr = BrowserManager::launch(launch_options, engine.as_deref()).await?;
+        if namespace_mode {
+            if let Some(ref shared) = state.shared_browser {
+                *shared.lock().await = Some(mgr.ws_url().to_string());
+            }
+            let mut mgr = mgr;
+            mgr.ensure_browser_context().await?;
+            mgr
+        } else {
+            mgr
+        }
+    };
+    state.browser = Some(mgr);
     state.launch_hash = Some(new_hash);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();

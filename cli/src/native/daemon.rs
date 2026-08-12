@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -20,18 +21,36 @@ use super::state;
 use super::stream::{IdleActivity, StreamServer};
 use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
 
+/// Session name -> that session's daemon state. In namespace mode a single
+/// daemon serves every session in the namespace, so commands are routed here
+/// by the `session` field they carry.
+type SessionMap =
+    std::sync::Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<DaemonState>>>>>;
+
+/// Snapshot of all daemon states currently registered (each session's state
+/// is created lazily on its first command).
+async fn snapshot_session_states(
+    sessions: &SessionMap,
+) -> Vec<Arc<tokio::sync::Mutex<DaemonState>>> {
+    sessions.lock().await.values().cloned().collect()
+}
+
 pub async fn run_daemon(session: &str) {
     let socket_dir = get_daemon_socket_dir();
     if !socket_dir.exists() {
         let _ = fs::create_dir_all(&socket_dir);
     }
 
+    // In namespace mode all sessions in a namespace are served by this one
+    // daemon, so every sidecar file is keyed by the namespace.
+    let daemon_name = crate::connection::daemon_key(session);
+
     // When debug mode is on, redirect stderr to a log file so daemon
     // output can be inspected (the daemon normally has stderr piped to its
     // parent which drops the read end after startup).
     #[cfg(unix)]
     if env::var("AGENT_BROWSER_DEBUG").is_ok() {
-        let log_path = socket_dir.join(format!("{}.log", session));
+        let log_path = socket_dir.join(format!("{}.log", daemon_name));
         if let Ok(file) = fs::File::create(&log_path) {
             use std::os::unix::io::IntoRawFd;
             let fd = file.into_raw_fd();
@@ -41,8 +60,9 @@ pub async fn run_daemon(session: &str) {
             }
             let _ = writeln!(
                 std::io::stderr(),
-                "[daemon] Debug logging started for session: {}",
-                session
+                "[daemon] Debug logging started for session: {} (daemon: {})",
+                session,
+                daemon_name
             );
         }
     } else {
@@ -63,15 +83,15 @@ pub async fn run_daemon(session: &str) {
         }
     }
 
-    let pid_path = socket_dir.join(format!("{}.pid", session));
+    let pid_path = socket_dir.join(format!("{}.pid", daemon_name));
     let _ = fs::write(&pid_path, process::id().to_string());
 
-    let version_path = socket_dir.join(format!("{}.version", session));
+    let version_path = socket_dir.join(format!("{}.version", daemon_name));
     let _ = fs::write(&version_path, env!("CARGO_PKG_VERSION"));
 
     // On Unix the daemon listens on a Unix domain socket; on Windows it uses
     // TCP, so there is no .sock file — only a .port file written by the server.
-    let socket_path = socket_dir.join(format!("{}.sock", session));
+    let socket_path = socket_dir.join(format!("{}.sock", daemon_name));
 
     #[cfg(unix)]
     if socket_path.exists() {
@@ -80,14 +100,14 @@ pub async fn run_daemon(session: &str) {
 
     #[cfg(windows)]
     {
-        let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
+        let _ = fs::remove_file(socket_dir.join(format!("{}.port", daemon_name)));
     }
 
-    let stream_path = socket_dir.join(format!("{}.stream", session));
+    let stream_path = socket_dir.join(format!("{}.stream", daemon_name));
     let _ = fs::remove_file(&stream_path);
-    let _ = fs::remove_file(socket_dir.join(format!("{}.engine", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
+    let _ = fs::remove_file(socket_dir.join(format!("{}.engine", daemon_name)));
+    let _ = fs::remove_file(socket_dir.join(format!("{}.provider", daemon_name)));
+    let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", daemon_name)));
 
     if let Ok(days_str) = env::var("AGENT_BROWSER_STATE_EXPIRE_DAYS") {
         if let Ok(days) = days_str.parse::<u64>() {
@@ -106,7 +126,7 @@ pub async fn run_daemon(session: &str) {
         .unwrap_or(0);
     match StreamServer::start_without_client(
         preferred_port,
-        session.to_string(),
+        daemon_name.clone(),
         true,
         idle_activity.clone(),
     )
@@ -134,7 +154,7 @@ pub async fn run_daemon(session: &str) {
 
     let result = run_socket_server(
         &socket_path,
-        session,
+        &daemon_name,
         stream_client,
         stream_server_instance,
         idle_activity,
@@ -149,14 +169,14 @@ pub async fn run_daemon(session: &str) {
     }
     #[cfg(windows)]
     {
-        let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
+        let _ = fs::remove_file(socket_dir.join(format!("{}.port", daemon_name)));
     }
     let _ = fs::remove_file(&pid_path);
     let _ = fs::remove_file(&version_path);
     let _ = fs::remove_file(&stream_path);
-    let _ = fs::remove_file(socket_dir.join(format!("{}.engine", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
+    let _ = fs::remove_file(socket_dir.join(format!("{}.engine", daemon_name)));
+    let _ = fs::remove_file(socket_dir.join(format!("{}.provider", daemon_name)));
+    let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", daemon_name)));
 
     if let Err(e) = result {
         let _ = writeln!(std::io::stderr(), "Daemon error: {}", e);
@@ -239,12 +259,12 @@ async fn run_socket_server(
     } else {
         None
     };
-    let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(DaemonState::new_with_stream(
-            stream_client,
-            stream_server,
-            idle_activity.clone(),
-        )));
+    // Namespace mode routes commands to per-session daemon states; each state
+    // is created lazily on its first command. The shared_browser slot lets the
+    // namespace's sessions share one Chrome instead of each spawning its own.
+    let sessions: SessionMap = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let shared_browser: Arc<tokio::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
     // Notifier used by handle_connection to signal the daemon loop to exit
     // after a "close" command, instead of calling process::exit() which skips
@@ -262,12 +282,20 @@ async fn run_socket_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
-                        let state = state.clone();
+                        let sessions = sessions.clone();
+                        let shared_browser = shared_browser.clone();
+                        let sc = stream_client.clone();
+                        let ss = stream_server.clone();
                         let idle_activity = idle_activity.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let daemon_session = session.to_string();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, idle_activity, sf, cn).await;
+                            handle_connection(
+                                stream, sessions, shared_browser, sc, ss, idle_activity, sf, cn,
+                                daemon_session,
+                            )
+                            .await;
                         });
                     }
                     Err(e) => {
@@ -276,23 +304,26 @@ async fn run_socket_server(
                 }
             }
             _ = drain_interval.tick() => {
-                let mut s = state.lock().await;
-                let process_exited = s
-                    .browser
-                    .as_mut()
-                    .map(|mgr| mgr.has_process_exited())
-                    .unwrap_or(false);
-                if process_exited {
-                    let _ = close_current_browser(&mut s).await;
-                } else if s.browser.is_some() {
-                    if let Err(error) = s.drain_cdp_events_background().await {
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "Failed to apply browser network controls: {}",
-                            error
-                        );
-                    } else {
-                        maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
+                let list = snapshot_session_states(&sessions).await;
+                for st in list {
+                    let mut s = st.lock().await;
+                    let process_exited = s
+                        .browser
+                        .as_mut()
+                        .map(|mgr| mgr.has_process_exited())
+                        .unwrap_or(false);
+                    if process_exited {
+                        let _ = close_current_browser(&mut s).await;
+                    } else if s.browser.is_some() {
+                        if let Err(error) = s.drain_cdp_events_background().await {
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "Failed to apply browser network controls: {}",
+                                error
+                            );
+                        } else {
+                            maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
+                        }
                     }
                 }
             }
@@ -302,8 +333,7 @@ async fn run_socket_server(
                     None => std::future::pending::<()>().await,
                 }
             }, if idle_timeout_ms.is_some() => {
-                let mut s = state.lock().await;
-                // The timer may have expired while a command held the state
+                // The timer may have expired while a command held a state
                 // lock. Command completion refreshes the shared activity
                 // clock before releasing that lock, so re-check it here.
                 if let Some(remaining) =
@@ -315,11 +345,20 @@ async fn run_socket_server(
                 // The default timeout is a leak backstop, not a lifecycle
                 // policy: never pull a headed, WebDriver, or attached browser
                 // out from under a human. Re-arm and keep waiting instead.
-                if idle_timeout.is_some_and(|t| t.is_default)
-                    && s.blocks_default_idle_shutdown()
-                {
-                    idle_sleep_pin = idle_timeout_ms
-                        .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                let list = snapshot_session_states(&sessions).await;
+                let mut blocked = false;
+                for st in &list {
+                    let mut s = st.lock().await;
+                    if idle_timeout.is_some_and(|t| t.is_default)
+                        && s.blocks_default_idle_shutdown()
+                    {
+                        idle_sleep_pin = idle_timeout_ms
+                            .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                        blocked = true;
+                        break;
+                    }
+                }
+                if blocked {
                     continue;
                 }
                 if idle_timeout.is_some_and(|t| t.is_default) {
@@ -329,8 +368,11 @@ async fn run_socket_server(
                         DEFAULT_IDLE_TIMEOUT_MS / 60_000
                     );
                 }
-                let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_all_browser_backends(&mut s).await;
+                for st in list {
+                    let mut s = st.lock().await;
+                    let _ = auto_save_restore_state(&mut s).await;
+                    let _ = close_all_browser_backends(&mut s).await;
+                }
                 break;
             }
             _ = idle_activity.notified(), if idle_timeout_ms.is_some() => {
@@ -345,9 +387,12 @@ async fn run_socket_server(
                 break;
             }
             _ = shutdown_signal() => {
-                let mut s = state.lock().await;
-                let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_all_browser_backends(&mut s).await;
+                let list = snapshot_session_states(&sessions).await;
+                for st in list {
+                    let mut s = st.lock().await;
+                    let _ = auto_save_restore_state(&mut s).await;
+                    let _ = close_all_browser_backends(&mut s).await;
+                }
                 break;
             }
         }
@@ -393,12 +438,12 @@ async fn run_socket_server(
     } else {
         None
     };
-    let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(DaemonState::new_with_stream(
-            stream_client,
-            stream_server,
-            idle_activity.clone(),
-        )));
+    // Namespace mode routes commands to per-session daemon states; each state
+    // is created lazily on its first command. The shared_browser slot lets the
+    // namespace's sessions share one Chrome instead of each spawning its own.
+    let sessions: SessionMap = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let shared_browser: Arc<tokio::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
     let close_notify = Arc::new(Notify::new());
 
@@ -416,12 +461,20 @@ async fn run_socket_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
-                        let state = state.clone();
+                        let sessions = sessions.clone();
+                        let shared_browser = shared_browser.clone();
+                        let sc = stream_client.clone();
+                        let ss = stream_server.clone();
                         let idle_activity = idle_activity.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let daemon_session = session.to_string();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, idle_activity, sf, cn).await;
+                            handle_connection(
+                                stream, sessions, shared_browser, sc, ss, idle_activity, sf, cn,
+                                daemon_session,
+                            )
+                            .await;
                         });
                     }
                     Err(e) => {
@@ -430,17 +483,20 @@ async fn run_socket_server(
                 }
             }
             _ = drain_interval.tick() => {
-                let mut s = state.lock().await;
-                let process_exited = s
-                    .browser
-                    .as_mut()
-                    .map(|mgr| mgr.has_process_exited())
-                    .unwrap_or(false);
-                if process_exited {
-                    let _ = close_current_browser(&mut s).await;
-                } else if s.browser.is_some() {
-                    s.drain_cdp_events_background().await;
-                    maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
+                let list = snapshot_session_states(&sessions).await;
+                for st in list {
+                    let mut s = st.lock().await;
+                    let process_exited = s
+                        .browser
+                        .as_mut()
+                        .map(|mgr| mgr.has_process_exited())
+                        .unwrap_or(false);
+                    if process_exited {
+                        let _ = close_current_browser(&mut s).await;
+                    } else if s.browser.is_some() {
+                        s.drain_cdp_events_background().await;
+                        maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
+                    }
                 }
             }
             _ = async {
@@ -449,7 +505,9 @@ async fn run_socket_server(
                     None => std::future::pending::<()>().await,
                 }
             }, if idle_timeout_ms.is_some() => {
-                let mut s = state.lock().await;
+                // The timer may have expired while a command held a state
+                // lock. Command completion refreshes the shared activity
+                // clock before releasing that lock, so re-check it here.
                 if let Some(remaining) =
                     remaining_idle_timeout(&idle_activity, idle_timeout_ms.unwrap_or_default())
                 {
@@ -459,11 +517,20 @@ async fn run_socket_server(
                 // The default timeout is a leak backstop, not a lifecycle
                 // policy: never pull a headed, WebDriver, or attached browser
                 // out from under a human. Re-arm and keep waiting instead.
-                if idle_timeout.is_some_and(|t| t.is_default)
-                    && s.blocks_default_idle_shutdown()
-                {
-                    idle_sleep_pin = idle_timeout_ms
-                        .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                let list = snapshot_session_states(&sessions).await;
+                let mut blocked = false;
+                for st in &list {
+                    let mut s = st.lock().await;
+                    if idle_timeout.is_some_and(|t| t.is_default)
+                        && s.blocks_default_idle_shutdown()
+                    {
+                        idle_sleep_pin = idle_timeout_ms
+                            .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                        blocked = true;
+                        break;
+                    }
+                }
+                if blocked {
                     continue;
                 }
                 if idle_timeout.is_some_and(|t| t.is_default) {
@@ -473,8 +540,11 @@ async fn run_socket_server(
                         DEFAULT_IDLE_TIMEOUT_MS / 60_000
                     );
                 }
-                let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_all_browser_backends(&mut s).await;
+                for st in list {
+                    let mut s = st.lock().await;
+                    let _ = auto_save_restore_state(&mut s).await;
+                    let _ = close_all_browser_backends(&mut s).await;
+                }
                 let _ = fs::remove_file(&port_path);
                 break;
             }
@@ -488,9 +558,12 @@ async fn run_socket_server(
                 break;
             }
             _ = shutdown_signal() => {
-                let mut s = state.lock().await;
-                let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_all_browser_backends(&mut s).await;
+                let list = snapshot_session_states(&sessions).await;
+                for st in list {
+                    let mut s = st.lock().await;
+                    let _ = auto_save_restore_state(&mut s).await;
+                    let _ = close_all_browser_backends(&mut s).await;
+                }
                 let _ = fs::remove_file(&port_path);
                 break;
             }
@@ -502,10 +575,14 @@ async fn run_socket_server(
 
 async fn handle_connection<S>(
     stream: S,
-    state: std::sync::Arc<tokio::sync::Mutex<DaemonState>>,
+    sessions: SessionMap,
+    shared_browser: Arc<tokio::sync::Mutex<Option<String>>>,
+    stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
+    stream_server: Option<Arc<StreamServer>>,
     idle_activity: Arc<IdleActivity>,
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
+    daemon_session: String,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -549,7 +626,35 @@ async fn handle_connection<S>(
                     .unwrap_or_default()
                     .to_string();
 
+                // In namespace mode the daemon is shared by every session in
+                // the namespace: commands carry the owning `session` and are
+                // routed to that session's isolated daemon state (created
+                // lazily). Without a namespace the daemon only ever serves the
+                // session it was spawned for.
+                let session = cmd
+                    .get("session")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&daemon_session)
+                    .to_string();
+
                 let response = {
+                    let state = {
+                        let mut map = sessions.lock().await;
+                        map.entry(session.clone())
+                            .or_insert_with(|| {
+                                let mut st = DaemonState::new_with_stream(
+                                    stream_client.clone(),
+                                    stream_server.clone(),
+                                    idle_activity.clone(),
+                                );
+                                if crate::connection::is_namespace_mode() {
+                                    st.shared_browser = Some(shared_browser.clone());
+                                }
+                                Arc::new(tokio::sync::Mutex::new(st))
+                            })
+                            .clone()
+                    };
                     let mut s = state.lock().await;
                     let response = execute_command(&cmd, &mut s).await;
                     // Refresh while the state lock is still held. An idle

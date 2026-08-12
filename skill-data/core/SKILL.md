@@ -447,7 +447,7 @@ EOF
 --state <path>          # load saved auth state from JSON
 --restore [name]        # auto-save/restore session state, defaults to --session
 --restore-save <policy> # auto, always, or never
---namespace <name>      # isolate daemon sockets and restore-state directories
+--namespace <name>      # share one daemon and one Chrome across every session in this namespace
 ```
 
 ## When to load another skill

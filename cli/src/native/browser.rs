@@ -126,6 +126,15 @@ pub(crate) fn should_track_target(target: &TargetInfo) -> bool {
         && (target.url.is_empty() || !is_internal_chrome_target(&target.url))
 }
 
+/// True when a target belongs to the given browser context. A None context
+/// matches everything (the manager is not context-scoped).
+pub(crate) fn target_in_context(context: &Option<String>, target: &TargetInfo) -> bool {
+    match context {
+        Some(ctx) => target.browser_context_id.as_deref() == Some(ctx.as_str()),
+        None => true,
+    }
+}
+
 fn update_page_target_info_in_pages(pages: &mut [PageInfo], target: &TargetInfo) -> bool {
     if let Some(page) = pages.iter_mut().find(|p| p.target_id == target.target_id) {
         page.url = target.url.clone();
@@ -409,6 +418,12 @@ pub struct BrowserManager {
     /// launch rules such as extension-forced headed mode. Meaningless for
     /// attached browsers (browser_process is None).
     headless: bool,
+    /// CDP browser context id this manager is scoped to. In namespace mode
+    /// every session shares the namespace's single Chrome instance but runs
+    /// in its own `Target.createBrowserContext`, so tabs are only created and
+    /// discovered inside this context and cookies/storage stay isolated
+    /// between sessions.
+    pub browser_context_id: Option<String>,
 }
 
 /// Stable machine-readable prefix for "the bound tab no longer exists"
@@ -515,6 +530,7 @@ impl BrowserManager {
                 bound_target_id: None,
                 bound_target_gone: None,
                 headless,
+                browser_context_id: None,
             };
             manager.discover_and_attach_targets().await?;
             manager
@@ -609,6 +625,7 @@ impl BrowserManager {
             bound_target_id: None,
             bound_target_gone: None,
             headless: true,
+            browser_context_id: None,
         };
 
         if direct_page {
@@ -635,6 +652,91 @@ impl BrowserManager {
         Self::connect_cdp(&ws_url).await
     }
 
+    /// Connect to an already-running Chrome (the namespace's shared instance)
+    /// and immediately move into a fresh private browser context so this
+    /// session never sees or shares tabs/cookies with other sessions that are
+    /// attached to the same browser.
+    pub async fn connect_shared_context(ws_url: &str) -> Result<Self, String> {
+        let ws_url = resolve_cdp_url(ws_url).await?;
+        let client = Arc::new(CdpClient::connect_with_headers(&ws_url, None).await?);
+        let mut manager = Self {
+            client,
+            browser_process: None,
+            ws_url,
+            pages: Vec::new(),
+            active_page_index: 0,
+            default_timeout_ms: 25_000,
+            download_path: None,
+            ignore_https_errors: false,
+            visited_origins: HashSet::new(),
+            next_tab_id: 1,
+            direct_page: false,
+            pin_tab: false,
+            bound_target_id: None,
+            bound_target_gone: None,
+            headless: true,
+            browser_context_id: None,
+        };
+        manager.ensure_browser_context().await?;
+        Ok(manager)
+    }
+
+    /// Create a fresh browser context (`Target.createBrowserContext`), create
+    /// a blank tab inside it, attach to it, and re-scope this manager so every
+    /// future tab is created and discovered within that context. Used in
+    /// namespace mode to isolate sessions that share one Chrome.
+    pub async fn ensure_browser_context(&mut self) -> Result<String, String> {
+        if let Some(ref ctx) = self.browser_context_id {
+            return Ok(ctx.clone());
+        }
+
+        let ctx_result = self
+            .client
+            .send_command_no_params("Target.createBrowserContext", None)
+            .await?;
+        let context_id = ctx_result
+            .get("browserContextId")
+            .and_then(|v| v.as_str())
+            .ok_or("Failed to get browserContextId")?
+            .to_string();
+
+        let create_result: CreateTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.createTarget",
+                &CreateTargetParams {
+                    url: "about:blank".to_string(),
+                    browser_context_id: Some(context_id.clone()),
+                },
+                None,
+            )
+            .await?;
+
+        let attach_result: AttachToTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: create_result.target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+
+        // Re-scope this manager to the new context: keep only the tab we just
+        // created so targets from the default context (e.g. the launcher's
+        // initial blank tab) never leak into the session.
+        self.browser_context_id = Some(context_id.clone());
+        let keep = create_result.target_id;
+        self.pages.retain(|p| p.target_id == keep);
+        self.active_page_index = 0;
+        self.bind_active_target();
+        self.enable_domains(&attach_result.session_id).await?;
+
+        Ok(context_id)
+    }
+
     async fn discover_and_attach_targets(&mut self) -> Result<(), String> {
         self.client
             .send_command_typed::<_, Value>(
@@ -649,10 +751,14 @@ impl BrowserManager {
             .send_command_typed("Target.getTargets", &json!({}), None)
             .await?;
 
+        // When this manager is scoped to a browser context (namespace mode),
+        // only attach to targets inside that context so sessions sharing one
+        // Chrome never observe each other's tabs.
+        let context = self.browser_context_id.clone();
         let page_targets: Vec<TargetInfo> = result
             .target_infos
             .into_iter()
-            .filter(should_track_target)
+            .filter(|t| should_track_target(t) && target_in_context(&context, t))
             .collect();
 
         if page_targets.is_empty() {
@@ -663,6 +769,7 @@ impl BrowserManager {
                     "Target.createTarget",
                     &CreateTargetParams {
                         url: "about:blank".to_string(),
+                        browser_context_id: self.browser_context_id.clone(),
                     },
                     None,
                 )
@@ -1338,6 +1445,11 @@ impl BrowserManager {
         self.browser_process.is_none()
     }
 
+    /// The CDP WebSocket URL of the browser this manager is connected to.
+    pub fn ws_url(&self) -> &str {
+        &self.ws_url
+    }
+
     pub fn is_direct_page_connection(&self) -> bool {
         self.direct_page
     }
@@ -1361,6 +1473,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: "about:blank".to_string(),
+                    browser_context_id: self.browser_context_id.clone(),
                 },
                 None,
             )
@@ -1526,6 +1639,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: target_url.to_string(),
+                    browser_context_id: self.browser_context_id.clone(),
                 },
                 None,
             )
@@ -2285,6 +2399,7 @@ async fn initialize_lightpanda_manager(
             bound_target_id: None,
             bound_target_gone: None,
             headless: true,
+            browser_context_id: None,
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {
@@ -2974,6 +3089,7 @@ mod tests {
             bound_target_id: None,
             bound_target_gone: None,
             headless: true,
+            browser_context_id: None,
         }
     }
 

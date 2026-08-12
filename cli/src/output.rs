@@ -2857,7 +2857,7 @@ Operations:
 
 Environment:
   AGENT_BROWSER_SESSION    Default session name
-  AGENT_BROWSER_NAMESPACE  Namespace for daemon sockets and restore state
+  AGENT_BROWSER_NAMESPACE  Namespace sharing one daemon and one Chrome across sessions
 
 Global Options:
   --json               Output as JSON
@@ -3701,7 +3701,7 @@ Authentication:
 
 Options:
   --session <name>           Isolated session (or AGENT_BROWSER_SESSION env)
-  --namespace <name>         Isolate daemon sockets and restore-state directories
+  --namespace <name>         Share one daemon and one Chrome across every session in this namespace
                              (or AGENT_BROWSER_NAMESPACE env)
   --executable-path <path>   Custom browser executable (or AGENT_BROWSER_EXECUTABLE_PATH)
   --extension <path>         Load browser extensions (repeatable)
@@ -3780,7 +3780,7 @@ Configuration:
 Environment:
   AGENT_BROWSER_CONFIG           Path to config file (or use --config)
   AGENT_BROWSER_SESSION          Session name (default: "default")
-  AGENT_BROWSER_NAMESPACE        Namespace for daemon sockets and restore state
+  AGENT_BROWSER_NAMESPACE        Namespace sharing one daemon and one Chrome across sessions
   AGENT_BROWSER_RESTORE          Auto-save/restore persistence key
   AGENT_BROWSER_RESTORE_SAVE     Restore save policy: auto, always, never
   AGENT_BROWSER_AUTOSAVE_INTERVAL_MS Min ms between periodic session autosaves (default: 30000, 0 disables)

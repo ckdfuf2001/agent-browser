@@ -140,21 +140,44 @@ pub fn get_socket_dir() -> PathBuf {
     base
 }
 
+/// True when running under a namespace: all sessions in the namespace share
+/// one daemon process (and, inside it, one browser tree).
+pub fn is_namespace_mode() -> bool {
+    env::var("AGENT_BROWSER_NAMESPACE")
+        .map(|ns| !sanitize_session_component(&ns).is_empty())
+        .unwrap_or(false)
+}
+
+/// Identity of the daemon that serves a session. In namespace mode every
+/// session in a namespace is served by the namespace's single daemon, so the
+/// daemon's sidecar files (`.pid`, `.sock`, `.port`, `.version`, `.config`,
+/// `.stream`) are keyed by the namespace, not the session. Without a
+/// namespace, each session owns a daemon keyed by its own name, preserving
+/// the classic one-daemon-per-session behavior.
+pub fn daemon_key(session: &str) -> String {
+    if is_namespace_mode() {
+        return sanitize_session_component(
+            &env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default(),
+        );
+    }
+    session.to_string()
+}
+
 #[cfg(unix)]
 fn get_socket_path(session: &str) -> PathBuf {
-    get_socket_dir().join(format!("{}.sock", session))
+    get_socket_dir().join(format!("{}.sock", daemon_key(session)))
 }
 
 fn get_pid_path(session: &str) -> PathBuf {
-    get_socket_dir().join(format!("{}.pid", session))
+    get_socket_dir().join(format!("{}.pid", daemon_key(session)))
 }
 
 fn get_version_path(session: &str) -> PathBuf {
-    get_socket_dir().join(format!("{}.version", session))
+    get_socket_dir().join(format!("{}.version", daemon_key(session)))
 }
 
 fn get_config_path(session: &str) -> PathBuf {
-    get_socket_dir().join(format!("{}.config", session))
+    get_socket_dir().join(format!("{}.config", daemon_key(session)))
 }
 
 /// Clean up stale socket and PID files for a session
@@ -165,7 +188,7 @@ pub fn cleanup_stale_files(session: &str) {
     let _ = fs::remove_file(&version_path);
     let config_path = get_config_path(session);
     let _ = fs::remove_file(&config_path);
-    let stream_path = get_socket_dir().join(format!("{}.stream", session));
+    let stream_path = get_socket_dir().join(format!("{}.stream", daemon_key(session)));
     let _ = fs::remove_file(&stream_path);
 
     #[cfg(unix)]
@@ -253,7 +276,7 @@ pub struct DaemonInventory {
 
 /// Read the session's `.version` sidecar if present and non-empty.
 pub fn read_session_version(session: &str) -> Option<String> {
-    let path = get_socket_dir().join(format!("{}.version", session));
+    let path = get_socket_dir().join(format!("{}.version", daemon_key(session)));
     fs::read_to_string(&path)
         .ok()
         .map(|s| s.trim().to_string())
@@ -363,18 +386,12 @@ pub fn walk_daemons() -> DaemonInventory {
 
 #[cfg(windows)]
 fn get_port_path(session: &str) -> PathBuf {
-    get_socket_dir().join(format!("{}.port", session))
+    get_socket_dir().join(format!("{}.port", daemon_key(session)))
 }
 
 #[cfg(windows)]
 fn port_identity_for_session(session: &str) -> String {
-    if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
-        let namespace = sanitize_session_component(&namespace);
-        if !namespace.is_empty() {
-            return format!("{}:{}", namespace, session);
-        }
-    }
-    session.to_string()
+    daemon_key(session)
 }
 
 #[cfg(windows)]
@@ -1105,7 +1122,17 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
     stream.set_read_timeout(Some(read_timeout_for(cmd))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
-    let mut json_str = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
+    // In namespace mode the daemon is shared by every session in the
+    // namespace, so the command must carry the session it belongs to. The
+    // daemon routes to the per-session browser context keyed by this field.
+    let mut body = cmd.clone();
+    if is_namespace_mode() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("session".to_string(), Value::String(session.to_string()));
+        }
+    }
+
+    let mut json_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     json_str.push('\n');
 
     stream

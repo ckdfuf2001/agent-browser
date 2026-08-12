@@ -2,6 +2,37 @@
 
 Browser automation CLI for AI agents. Fast native Rust CLI.
 
+> **Fork note (ckdfuf2001/agent-browser):** This is a fork of
+> [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser) (base: `v0.34.0`). The
+> changes described below were authored with DeepSeek v4 and are not present upstream. The goal of
+> the fork is to give a whole set of sessions (for example every repo in a multi-repo workspace) a
+> single shared browser daemon and a single shared Chrome tree while keeping each session's data
+> isolated, which is what [OpenCode WebUI](https://github.com/ckdfuf2001/opencode-webui) needs to
+> avoid one Chrome process per repo.
+
+### What DeepSeek v4 changed
+
+- **Namespace-scoped daemon identity** (`cli/src/connection.rs`). Added `is_namespace_mode()` and
+  `daemon_key()` so that in namespace mode every sidecar file (`.pid`, `.port`, `.sock`, `.version`,
+  `.config`, `.stream`) is keyed by the namespace instead of by the session. Client commands now
+  carry the owning `session` field so a single shared daemon can route to the right per-session state.
+- **One daemon serving many sessions** (`cli/src/native/daemon.rs`). Replaced the single
+  `DaemonState` with a `SessionMap` that lazily creates a per-session `DaemonState` on first use and
+  routes commands by the `session` field. The drain/autosave/idle loops now iterate every registered
+  session state. Added a shared `shared_browser` slot so sessions in a namespace share one Chrome.
+- **Shared Chrome with private browser contexts** (`cli/src/native/browser.rs`,
+  `cli/src/native/cdp/types.rs`, `cli/src/native/actions.rs`). Added
+  `BrowserManager::connect_shared_context()` and `ensure_browser_context()` (driving
+  `Target.createBrowserContext` / `createTarget` / `attachToTarget`), and thread
+  `browser_context_id` through every `createTarget` and target-discovery path. Both `auto_launch`
+  and the explicit `handle_launch` action now publish the shared WebSocket URL and connect later
+  sessions to it instead of launching another Chrome tree.
+- **CDP-level session isolation** (`cli/src/native/actions.rs`, `cli/src/native/browser.rs`). Added
+  `target_in_context()` and applied it to `targetCreated`, `targetInfoChanged`, `attachedToTarget`,
+  and `discover_and_attach_targets()` so a namespace session only ever observes targets inside its
+  own browser context. Without this a shared Chrome leaked one session's tabs and navigation into
+  another's page list.
+
 [![skills.sh](https://skills.sh/b/vercel-labs/agent-browser)](https://skills.sh/vercel-labs/agent-browser)
 
 ## Installation
@@ -663,6 +694,36 @@ Each session has its own:
 - Navigation history
 - Authentication state
 
+### Namespace mode
+
+Namespace mode turns the model around for groups of sessions that belong to the same workspace or product: instead of one daemon and one Chrome tree per session, a namespace gets a single shared daemon and a single shared Chrome tree. Each session inside the namespace still gets its own private browser context, so cookies, storage, tabs, and navigation history stay fully isolated between sessions. This is what OpenCode WebUI uses to give every repo an isolated browser while keeping the whole workspace light on system resources.
+
+```bash
+# Every command in the namespace talks to the same daemon and the same Chrome
+AGENT_BROWSER_NAMESPACE=opencode AGENT_BROWSER_SESSION=repo-a agent-browser open https://site-a.com
+AGENT_BROWSER_NAMESPACE=opencode AGENT_BROWSER_SESSION=repo-b agent-browser open https://site-b.com
+
+# Or via flag, for a single command
+agent-browser --namespace opencode --session repo-a open https://site-a.com
+```
+
+MCP servers can be bound to a namespace the same way (each MCP client then picks its own session):
+
+```bash
+AGENT_BROWSER_NAMESPACE=opencode agent-browser mcp
+```
+
+How it works:
+
+- **One daemon per namespace.** The daemon's sidecar files (`.pid`, `.port`, `.sock`, `.config`, `.stream`, …) are keyed by the namespace, and each request carries the `session` it belongs to. The daemon routes each request to that session's own daemon state, created lazily on first use, so sessions never share state objects.
+- **One Chrome per namespace.** The first session to open a browser launches Chrome and publishes its WebSocket URL. Every later session attaches to that same instance and calls `Target.createBrowserContext` to get a fresh private context instead of spawning a second Chrome tree.
+- **CDP-level isolation.** A session only discovers and tracks targets whose `browserContextId` matches its own private context, so tabs, cookies, and storage can never leak between sessions that share the browser.
+
+Caveats:
+
+- A namespace daemon is shared, so daemon-level options (`--debug`, `--action-policy`, `--confirm-actions`, `--idle-timeout`, `--default-timeout`, `--no-auto-dialog`) must be identical across every command in the namespace. A mismatch stops the shared daemon for a restart, which also closes every session's browser. See [`daemon_config_fingerprint`](cli/src/connection.rs).
+- Session-level options (Chrome profile, extensions, storage state, restore, headers, …) are per-session and can differ freely.
+
 ### Tab pinning
 
 When several sessions share one Chrome over `--cdp`, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab happens to be active, which is usually another session's.
@@ -941,7 +1002,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--restore-check-url <glob>` | Validate restored state against a URL pattern |
 | `--restore-check-text <text>` | Validate restored state against page text |
 | `--restore-check-fn <js>` | Validate restored state against a truthy JavaScript expression |
-| `--namespace <name>` | Isolate daemon sockets and restore-state directories |
+| `--namespace <name>` | Namespace for the shared daemon and shared Chrome (or `AGENT_BROWSER_NAMESPACE` env). Every session in the namespace is served by one daemon and one browser, isolated via CDP browser contexts (see [Namespace mode](#namespace-mode)) |
 | `--session-name <name>` | Legacy alias for restore persistence key |
 | `--profile <name\|path>` | Chrome profile name or persistent directory path (or `AGENT_BROWSER_PROFILE` env) |
 | `--state <path>` | Load storage state from JSON file (or `AGENT_BROWSER_STATE` env) |
