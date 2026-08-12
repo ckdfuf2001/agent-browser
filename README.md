@@ -33,6 +33,37 @@ Browser automation CLI for AI agents. Fast native Rust CLI.
   own browser context. Without this a shared Chrome leaked one session's tabs and navigation into
   another's page list.
 
+### Building the fork on Linux/macOS
+
+The fork's GitHub release (`v0.34.0-namespace.1`) currently ships only the `win32-x64` binary, so
+Windows works out of the box. On Linux/macOS, `npm run dev` inside OpenCode WebUI would fall back to
+the npm package (the upstream build, without namespace mode). To use the fork build there, build it
+from source and point the WebUI installer at the resulting asset:
+
+```bash
+# 1. Clone the fork and build the native binary
+git clone https://github.com/ckdfuf2001/agent-browser
+cd agent-browser
+pnpm install
+pnpm build:native          # requires Rust (https://rustup.rs)
+
+# 2. (Optional, recommended) Upload it as a release asset so OpenCode WebUI's
+#    installer can pick it up automatically. It reads the repository's `latest`
+#    release, which currently carries only:
+#    - agent-browser-win32-x64.exe   (Windows, already present)
+#    Build and add the missing ones (e.g. gh release upload v0.34.0-namespace.1
+#    bin/agent-browser-darwin-arm64 bin/agent-browser-darwin-x64
+#    bin/agent-browser-linux-x64 bin/agent-browser-linux-musl-x64), or create a
+#    new release with the full set so every platform resolves from the same tag.
+```
+
+When the fork release carries the matching asset, no extra step is needed: OpenCode WebUI's
+`install-agent-browser.js` downloads it automatically (override the repo with
+`AGENT_BROWSER_GITHUB_REPO`, or pin with `AGENT_BROWSER_VERSION`). Until then, you can drop the
+built binary and Chromium under the WebUI's `vendor/agent-browser/` and `vendor/chromium/` (or run
+the CLI binary directly with the README's [Sessions](#sessions) / [Namespace mode](#namespace-mode)
+examples).
+
 [![skills.sh](https://skills.sh/b/vercel-labs/agent-browser)](https://skills.sh/vercel-labs/agent-browser)
 
 ## Installation
