@@ -434,6 +434,36 @@ pub fn daemon_ready(session: &str) -> bool {
     }
 }
 
+/// Verify that the listener on the daemon port actually speaks the daemon
+/// protocol. On Windows a killed daemon's Chrome child can inherit the
+/// listening socket handle, leaving a "zombie" socket that accepts TCP
+/// connects (so `daemon_ready` returns true) but never replies. Callers
+/// would otherwise hang forever trying to reuse it; this probe treats a
+/// listener that does not answer a lightweight command as stale so the
+/// daemon can be restarted on a fresh port.
+#[cfg(windows)]
+fn daemon_responds(session: &str) -> bool {
+    let port = resolve_port(session);
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().unwrap(),
+        Duration::from_millis(200),
+    ) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let probe = json!({ "id": "daemon-probe", "action": "session" }).to_string();
+    let mut line = probe;
+    line.push('\n');
+    if stream.write_all(line.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 2048];
+    match stream.read(&mut buf) {
+        Ok(n) => n > 0,
+        Err(_) => false,
+    }
+}
+
 /// Result of ensure_daemon indicating whether a new daemon was started
 pub struct DaemonResult {
     /// True if we connected to an existing daemon, false if we started a new one
@@ -610,7 +640,13 @@ fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
     opts.debug.hash(&mut hasher);
     opts.action_policy.hash(&mut hasher);
     opts.confirm_actions.hash(&mut hasher);
-    opts.idle_timeout.hash(&mut hasher);
+    // idle_timeout is intentionally excluded: it only controls when the
+    // daemon self-terminates and never affects browser behavior, so clients
+    // that disagree on it (e.g. an MCP server setting a long timeout while a
+    // CLI uses the default) must NOT force a daemon restart. Restarting a
+    // healthy daemon kills its browser, resetting the tracked tab to
+    // about:blank and losing session state (the root cause of intermittent
+    // "about:blank" / request-timeout failures in namespace mode).
     opts.default_timeout.hash(&mut hasher);
     opts.no_auto_dialog.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -830,7 +866,24 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
             // Fall through to spawn a new daemon below
         } else {
             match ready_existing_daemon_result(session, opts, Duration::from_secs(1)) {
-                Some(result) => return Ok(result),
+                Some(result) => {
+                    // The listener accepts connects but may be a stale
+                    // "zombie" socket whose owning daemon died while its
+                    // Chrome child kept the listening handle alive. Such a
+                    // socket never replies, so verify liveness before reusing
+                    // it (Windows-only: unix sockets fail fast on their own).
+                    #[cfg(windows)]
+                    {
+                        if !daemon_responds(session) {
+                            stop_existing_daemon_for_restart(session);
+                            restarted = true;
+                        } else {
+                            return Ok(result);
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    return Ok(result);
+                }
                 None => {
                     stop_existing_daemon_for_restart(session);
                     restarted = true;
