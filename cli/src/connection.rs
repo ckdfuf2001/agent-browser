@@ -445,6 +445,17 @@ pub fn daemon_ready(session: &str) -> bool {
 /// daemon can be restarted on a fresh port.
 #[cfg(windows)]
 fn daemon_responds(session: &str) -> bool {
+    // Prefer the sidecar PID file: a live daemon process is proof the socket
+    // is not a zombie, regardless of whether it is momentarily busy serving
+    // a long-running command (screenshots, launches, waits). The previous
+    // protocol probe with a short read timeout misclassified busy daemons as
+    // zombies and forced a restart, killing the browser and losing session
+    // state. Only fall back to the probe when no usable PID file exists.
+    if let Ok(pid_str) = fs::read_to_string(&get_pid_path(session)) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            return is_pid_alive(pid);
+        }
+    }
     let port = resolve_port(session);
     let Ok(mut stream) = TcpStream::connect_timeout(
         &format!("127.0.0.1:{}", port).parse().unwrap(),
@@ -452,7 +463,10 @@ fn daemon_responds(session: &str) -> bool {
     ) else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    // Generous probe timeout so a busy-but-healthy daemon is not mistaken for
+    // a zombie and force-restarted; only a socket that stays silent this long
+    // is treated as stale.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let probe = json!({ "id": "daemon-probe", "action": "session" }).to_string();
     let mut line = probe;
     line.push('\n');
@@ -715,6 +729,21 @@ fn ready_existing_daemon_result(
     opts: &DaemonOptions,
     timeout: Duration,
 ) -> Option<DaemonResult> {
+    // A live daemon is reused unconditionally, regardless of config
+    // fingerprint. Only a dead PID justifies a restart: killing a healthy
+    // daemon loses its browser and session state. The config fingerprint is
+    // consulted only when no live PID is recorded (daemon recently spawned,
+    // or a zombie socket whose owner died).
+    if let Ok(pid_str) = fs::read_to_string(&get_pid_path(session)) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if is_pid_alive(pid) {
+                return Some(DaemonResult {
+                    already_running: true,
+                    restarted: false,
+                });
+            }
+        }
+    }
     match daemon_config_status(session, opts) {
         DaemonConfigStatus::Matches => Some(DaemonResult {
             already_running: true,
