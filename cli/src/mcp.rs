@@ -3587,11 +3587,26 @@ fn append_common_global_args(
 
 fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Result<CliRun, String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
+
+    // Route the CLI child's stdout/stderr through temp files instead of
+    // pipes. On Windows, the child process may spawn a long-lived daemon,
+    // and because the daemon is spawned with a piped stderr it inherits
+    // every inheritable handle of the child - including the write-ends of
+    // the output pipes we created here. The daemon keeps those write-ends
+    // open for its whole lifetime, so read_to_end never sees EOF and the
+    // MCP tool call hangs until the timeout on a cold start. A file always
+    // reaches EOF no matter what the daemon inherits, so reading the file
+    // after the child exits is race-free.
+    let (out_path, mut out_file) =
+        temp_output_file("out").map_err(|e| format!("failed to create temp stdout: {}", e))?;
+    let (err_path, mut err_file) =
+        temp_output_file("err").map_err(|e| format!("failed to create temp stderr: {}", e))?;
+
     let mut command = Command::new(exe);
     command
         .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(out_file.try_clone().map_err(|e| e.to_string())?)
+        .stderr(err_file.try_clone().map_err(|e| e.to_string())?)
         .stdin(if stdin_body.is_some() {
             Stdio::piped()
         } else {
@@ -3610,24 +3625,6 @@ fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Resu
             .map_err(|e| format!("failed to write child stdin: {}", e))?;
     }
 
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to open child stdout".to_string())?;
-    let mut child_stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "failed to open child stderr".to_string())?;
-
-    let stdout_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        child_stdout.read_to_end(&mut buf).map(|_| buf)
-    });
-    let stderr_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        child_stderr.read_to_end(&mut buf).map(|_| buf)
-    });
-
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let status = loop {
@@ -3637,8 +3634,8 @@ fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Resu
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let stdout = join_output(stdout_thread)?;
-                    let stderr = join_output(stderr_thread)?;
+                    let stdout = read_output_file(&out_path, &mut out_file);
+                    let stderr = read_output_file(&err_path, &mut err_file);
                     return Ok(CliRun {
                         exit_code: None,
                         stdout,
@@ -3651,8 +3648,8 @@ fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Resu
         }
     };
 
-    let stdout = join_output(stdout_thread)?;
-    let stderr = join_output(stderr_thread)?;
+    let stdout = read_output_file(&out_path, &mut out_file);
+    let stderr = read_output_file(&err_path, &mut err_file);
 
     Ok(CliRun {
         exit_code: status.code(),
@@ -3661,12 +3658,38 @@ fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Resu
     })
 }
 
-fn join_output(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<String, String> {
-    let bytes = handle
-        .join()
-        .map_err(|_| "failed to join output reader".to_string())?
-        .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+static TEMP_OUTPUT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn temp_output_file(tag: &str) -> io::Result<(std::path::PathBuf, fs::File)> {
+    let counter = TEMP_OUTPUT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = env::temp_dir().join(format!(
+        "agent-browser-mcp-{}-{}-{}-{}.txt",
+        env::current_exe()
+            .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            .unwrap_or_default(),
+        std::process::id(),
+        counter,
+        tag,
+    ));
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    Ok((path, file))
+}
+
+fn read_output_file(path: &std::path::Path, file: &mut fs::File) -> String {
+    use std::io::Seek;
+    let result = (|| -> io::Result<String> {
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        Ok(contents)
+    })();
+    let _ = fs::remove_file(path);
+    result.unwrap_or_default()
 }
 
 fn append_timeout_message(stderr: String, timeout_ms: u64) -> String {

@@ -30,8 +30,8 @@ use windows_sys::Win32::System::Threading::OpenProcess;
 
 use commands::{gen_id, parse_command, ParseError};
 use connection::{
-    cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
-    send_command, walk_daemons, DaemonOptions, Response,
+    cleanup_stale_files, daemon_key, daemon_unreachable, ensure_daemon, get_socket_dir,
+    is_pid_alive, send_command, walk_daemons, DaemonOptions, Response,
 };
 use flags::{clean_args, parse_flags, Flags};
 use install::run_install;
@@ -571,7 +571,12 @@ fn run_session_id(args: &[String], json_mode: bool) {
 
 fn run_session_info(session: &str, json_mode: bool) {
     let inventory = walk_daemons();
-    let active = inventory.sessions.iter().find(|s| s.name == session);
+    // In namespace mode every session is served by the namespace's single
+    // daemon, whose sidecar files are keyed by the namespace, not the
+    // session. match against daemon_key(session) so `session info` reports
+    // the right daemon for any session in the namespace (e.g. "default").
+    let key = daemon_key(session);
+    let active = inventory.sessions.iter().find(|s| s.name == key);
     let runtime = active.and_then(|_| {
         send_command(
             json!({

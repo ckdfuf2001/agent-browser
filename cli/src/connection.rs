@@ -17,6 +17,8 @@ use std::os::unix::net::UnixStream;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
+use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 pub(crate) const INTERNAL_DAEMON_SHUTDOWN_ACTION: &str = "__agent_browser_internal_shutdown";
@@ -965,7 +967,9 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
     #[cfg(windows)]
     {
+        use std::os::windows::io::AsRawHandle;
         use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::Foundation::HANDLE;
 
         let mut cmd = Command::new(&exe_path);
         cmd.env("AGENT_BROWSER_DAEMON", "1");
@@ -974,14 +978,44 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         const DETACHED_PROCESS: u32 = 0x00000008;
 
-        daemon_child = Some(
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to start daemon: {}", e))?,
-        );
+        // Windows handle inheritance is all-or-nothing: because the daemon's
+        // stderr is piped, CreateProcess runs with bInheritHandles=TRUE and
+        // the daemon inherits every inheritable handle in this process -
+        // including the stdout/stderr pipe write-ends that a parent (e.g. the
+        // MCP server) is reading to EOF. If the daemon keeps those write-ends
+        // open, the parent's read never reaches EOF and the CLI call hangs
+        // until timeout on a cold start. Clear HANDLE_FLAG_INHERIT on our own
+        // stdio handles for the duration of the spawn so the long-lived daemon
+        // cannot hold the parent's pipes open.
+        let std_handles = [
+            std::io::stdin().as_raw_handle() as HANDLE,
+            std::io::stdout().as_raw_handle() as HANDLE,
+            std::io::stderr().as_raw_handle() as HANDLE,
+        ];
+        let clear_inherit = |set: bool| {
+            for &handle in &std_handles {
+                unsafe {
+                    SetHandleInformation(
+                        handle,
+                        HANDLE_FLAG_INHERIT,
+                        if set { HANDLE_FLAG_INHERIT } else { 0 },
+                    );
+                }
+            }
+        };
+        clear_inherit(false);
+
+        let spawn_result = cmd
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start daemon: {}", e));
+
+        clear_inherit(true);
+
+        daemon_child = Some(spawn_result?);
     }
 
     let spawned_pid = daemon_child.as_ref().map(|child| child.id());
