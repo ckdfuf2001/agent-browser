@@ -655,9 +655,19 @@ async fn handle_connection<S>(
                         };
                         all_sessions.retain(|k| k != &session);
                         if !all_sessions.is_empty() {
+                            let links = all_sessions
+                                .iter()
+                                .map(|s| format!("[{}](?session={})", s, s))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let hrefs: Vec<String> = all_sessions.iter().map(|s| format!("?session={}", s)).collect();
                             let response = serde_json::json!({
                                 "success": false,
-                                "error": format!("No session specified. Open sessions: {}. Please specify session, e.g. session: \"{}\"", all_sessions.join(", "), all_sessions[0])
+                                "error": format!("No session specified. Open sessions: {}. Please specify session, e.g. session: \"{}\"", links, all_sessions[0]),
+                                "data": {
+                                    "sessions": all_sessions,
+                                    "hrefs": hrefs
+                                }
                             });
                             let mut resp = serde_json::to_string(&response).unwrap_or_default();
                             resp.push('\n');
