@@ -638,6 +638,37 @@ async fn handle_connection<S>(
                     .unwrap_or(&daemon_session)
                     .to_string();
 
+                // If no explicit session and default is blank, list open sessions in English
+                if (session == "default" || session == "opencode") && crate::connection::is_namespace_mode() {
+                    let other_sessions: Vec<String> = {
+                        let map = sessions.lock().await;
+                        map.keys()
+                            .filter(|k| *k != "default" && *k != "opencode" && !k.starts_with("auto-"))
+                            .cloned()
+                            .collect()
+                    };
+                    if !other_sessions.is_empty() {
+                        // Also check auto sessions
+                        let mut all_sessions: Vec<String> = {
+                            let map = sessions.lock().await;
+                            map.keys().cloned().collect()
+                        };
+                        all_sessions.retain(|k| k != &session);
+                        if !all_sessions.is_empty() {
+                            let response = serde_json::json!({
+                                "success": false,
+                                "error": format!("No session specified. Open sessions: {}. Please specify session, e.g. session: \"{}\"", all_sessions.join(", "), all_sessions[0])
+                            });
+                            let mut resp = serde_json::to_string(&response).unwrap_or_default();
+                            resp.push('\n');
+                            if writer.write_all(resp.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 let response = {
                     let state = {
                         let mut map = sessions.lock().await;
