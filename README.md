@@ -725,6 +725,10 @@ Each session has its own:
 - Navigation history
 - Authentication state
 
+> **Auto session (patched):** Set `AGENT_BROWSER_AUTO_SESSION=1` to auto-hash `default`/`opencode` to `auto-<cwd-hash>` per repo. Without a `session`, `read` on a fresh `default` returns blank; with `auto` it is isolated per repo. Always close after use: `agent-browser close` / `close --all` or `agent_browser_close` (idle `AGENT_BROWSER_IDLE_TIMEOUT_MS` auto-closes, default 1h, `86400000` in `opencode-webui`).
+
+> **No session specified:** If you call `agent_browser_*` without `session` and multiple sessions are open, the daemon now returns in English: `No session specified. Open sessions: <list>. Please specify session, e.g. session: "<name>"` with `href="?session=<name>"` links that copy the session. Pass the shown `session` on the next call.
+
 ### Namespace mode
 
 Namespace mode turns the model around for groups of sessions that belong to the same workspace or product: instead of one daemon and one Chrome tree per session, a namespace gets a single shared daemon and a single shared Chrome tree. Each session inside the namespace still gets its own private browser context, so cookies, storage, tabs, and navigation history stay fully isolated between sessions. This is what OpenCode WebUI uses to give every repo an isolated browser while keeping the whole workspace light on system resources.
