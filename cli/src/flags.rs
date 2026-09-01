@@ -3,6 +3,7 @@ use crate::plugins::PluginConfig;
 use serde::Deserialize;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 const CONFIG_DIR: &str = ".agent-browser";
@@ -481,10 +482,24 @@ pub fn parse_flags(args: &[String]) -> Flags {
         json: env_var_is_truthy("AGENT_BROWSER_JSON") || config.json.unwrap_or(false),
         headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(false),
         debug: env_var_is_truthy("AGENT_BROWSER_DEBUG") || config.debug.unwrap_or(false),
-        session: env::var("AGENT_BROWSER_SESSION")
-            .ok()
-            .or(config.session)
-            .unwrap_or_else(|| "default".to_string()),
+        session: {
+            let s = env::var("AGENT_BROWSER_SESSION")
+                .ok()
+                .or(config.session)
+                .unwrap_or_else(|| "default".to_string());
+            if env_var_is_truthy("AGENT_BROWSER_AUTO_SESSION") && (s == "default" || s == "opencode") {
+                let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let ns = env::var("AGENT_BROWSER_NAMESPACE")
+                    .ok()
+                    .or(config.namespace.clone())
+                    .unwrap_or_default();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                format!("{}:{}", ns, cwd.display()).hash(&mut hasher);
+                format!("auto-{:016x}", hasher.finish())
+            } else {
+                s
+            }
+        },
         restore: env::var("AGENT_BROWSER_RESTORE").ok().or(config.restore),
         restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
             .ok()
