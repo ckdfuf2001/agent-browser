@@ -10,6 +10,19 @@ Browser automation CLI for AI agents. Fast native Rust CLI.
 > isolated, which is what [OpenCode WebUI](https://github.com/ckdfuf2001/opencode-webui) needs to
 > avoid one Chrome process per repo.
 
+### :new: Session Proxy (MCP, no Rust build needed)
+
+> **NEW in this fork** — everything in this section is marked :new:. The rest of this README is upstream content unless marked as a fork change.
+
+- **What**: branch `proxy/session-isolation` — a zero-dependency Node MCP proxy (`mcp-server.mjs`) that forces explicit `namespace`+`session` on every call, confirms reuse of live sessions (`reuse:true`), auto-closes idle sessions (TTL + LRU, never touches in-flight work), supports Korean names, and absorbs the cold-start `open` hang. Works with the **stock** agent-browser binary.
+- **vs the Rust fork changes below**: the fork shares one Chrome tree via browser contexts (needs a custom build); the proxy gives each session its own browser under one daemon (no build). Use either or both.
+- **Install** (Windows x64):
+  1. Download from release [`proxy-v2.2.0`](https://github.com/ckdfuf2001/agent-browser/releases/tag/proxy-v2.2.0): `agent-browser-proxy-v2.2.0.zip` + `agent-browser-win32-x64-0.33.2.zip`.
+  2. Unzip, then install Chrome (first time only): `agent-browser.exe install`.
+  3. Point your `opencode.json` MCP `command` at `mcp-server.mjs` (`--cli` = exe path), set `AGENT_BROWSER_EXECUTABLE_PATH` to the installed `chrome.exe`, then reload MCP.
+  4. First call: `agent_browser_session_ensure { namespace: "opencode", task: "..." }`, and reuse the returned session for the whole task.
+- **Docs**: branch [`proxy/session-isolation`](https://github.com/ckdfuf2001/agent-browser/tree/proxy/session-isolation) (README comparison table), architecture doc `chat_uploads/agent-browser_arch-to-be.html` on that branch.
+
 ### What DeepSeek v4 changed
 
 - **Namespace-scoped daemon identity** (`cli/src/connection.rs`). Added `is_namespace_mode()` and
