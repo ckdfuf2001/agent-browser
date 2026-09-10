@@ -10,72 +10,28 @@ Browser automation CLI for AI agents. Fast native Rust CLI.
 > isolated, which is what [OpenCode WebUI](https://github.com/ckdfuf2001/opencode-webui) needs to
 > avoid one Chrome process per repo.
 
-### :new: Session Proxy (MCP, no Rust build needed)
+### :new: NEW in this fork (upstream에 없는 변경점)
 
-> **NEW in this fork** — everything in this section is marked :new:. The rest of this README is upstream content unless marked as a fork change.
+> 아래가 포크 변경점 전부입니다. 그 아래부터는 upstream README 그대로입니다.
 
-- **What**: branch `proxy/session-isolation` — a zero-dependency Node MCP proxy (`mcp-server.mjs`) that forces explicit `namespace`+`session` on every call, confirms reuse of live sessions (`reuse:true`), auto-closes idle sessions (TTL + LRU, never touches in-flight work), supports Korean names, and absorbs the cold-start `open` hang. Works with the **stock** agent-browser binary.
-- **vs the Rust fork changes below**: the fork shares one Chrome tree via browser contexts (needs a custom build); the proxy gives each session its own browser under one daemon (no build). Use either or both.
-- **Install** (Windows x64):
-  1. Download from release [`proxy-v2.2.0`](https://github.com/ckdfuf2001/agent-browser/releases/tag/proxy-v2.2.0): `agent-browser-proxy-v2.2.0.zip` + `agent-browser-win32-x64-0.33.2.zip`.
-  2. Unzip, then install Chrome (first time only): `agent-browser.exe install`.
-  3. Point your `opencode.json` MCP `command` at `mcp-server.mjs` (`--cli` = exe path), set `AGENT_BROWSER_EXECUTABLE_PATH` to the installed `chrome.exe`, then reload MCP.
-  4. First call: `agent_browser_session_ensure { namespace: "opencode", task: "..." }`, and reuse the returned session for the whole task.
-- **Docs**: branch [`proxy/session-isolation`](https://github.com/ckdfuf2001/agent-browser/tree/proxy/session-isolation) (README comparison table), architecture doc `chat_uploads/agent-browser_arch-to-be.html` on that branch.
+#### 1. Session Proxy - MCP 세션 격리 (Rust 빌드 불필요) :new:
 
-### What DeepSeek v4 changed
+- 브랜치 `proxy/session-isolation` - 의존성 없는 Node MCP 프록시(`mcp-server.mjs`). 매 호출마다 `namespace`+`session` 명시 강제, live 세션 재사용은 탭 목록 확인 후 `reuse:true` 확정, idle 세션 자동 정리(TTL+LRU, 실행 중 작업은 절대 보호), 한글 이름 지원, 콜드 `open` hang 흡수. **스톡 바이너리**로 동작.
+- Rust 포크(아래 2번)와는 반대로 세션별 브라우저 1개씩(단일 데몬 아래). 둘 중 하나만 써도 되고 같이 써도 됩니다.
+- **설치** (Windows x64):
+  1. 릴리즈 [`proxy-v2.2.0`](https://github.com/ckdfuf2001/agent-browser/releases/tag/proxy-v2.2.0)에서 `agent-browser-proxy-v2.2.0.zip` + `agent-browser-win32-x64-0.33.2.zip` 다운로드.
+  2. 압축 해제 후 Chrome 설치(최초 1회): `agent-browser.exe install`.
+  3. `opencode.json` MCP `command`를 `mcp-server.mjs`로(`--cli`=exe 경로), `AGENT_BROWSER_EXECUTABLE_PATH`를 설치된 `chrome.exe`로 지정 후 MCP 리로드.
+  4. 첫 호출: `agent_browser_session_ensure { namespace: "opencode", task: "..." }`, 반환된 세션을 과제 내내 재사용.
+- 문서: [브랜치](https://github.com/ckdfuf2001/agent-browser/tree/proxy/session-isolation) 비교표, 아키텍처 `chat_uploads/agent-browser_arch-to-be.html` (해당 브랜치).
 
-- **Namespace-scoped daemon identity** (`cli/src/connection.rs`). Added `is_namespace_mode()` and
-  `daemon_key()` so that in namespace mode every sidecar file (`.pid`, `.port`, `.sock`, `.version`,
-  `.config`, `.stream`) is keyed by the namespace instead of by the session. Client commands now
-  carry the owning `session` field so a single shared daemon can route to the right per-session state.
-- **One daemon serving many sessions** (`cli/src/native/daemon.rs`). Replaced the single
-  `DaemonState` with a `SessionMap` that lazily creates a per-session `DaemonState` on first use and
-  routes commands by the `session` field. The drain/autosave/idle loops now iterate every registered
-  session state. Added a shared `shared_browser` slot so sessions in a namespace share one Chrome.
-- **Shared Chrome with private browser contexts** (`cli/src/native/browser.rs`,
-  `cli/src/native/cdp/types.rs`, `cli/src/native/actions.rs`). Added
-  `BrowserManager::connect_shared_context()` and `ensure_browser_context()` (driving
-  `Target.createBrowserContext` / `createTarget` / `attachToTarget`), and thread
-  `browser_context_id` through every `createTarget` and target-discovery path. Both `auto_launch`
-  and the explicit `handle_launch` action now publish the shared WebSocket URL and connect later
-  sessions to it instead of launching another Chrome tree.
-- **CDP-level session isolation** (`cli/src/native/actions.rs`, `cli/src/native/browser.rs`). Added
-  `target_in_context()` and applied it to `targetCreated`, `targetInfoChanged`, `attachedToTarget`,
-  and `discover_and_attach_targets()` so a namespace session only ever observes targets inside its
-  own browser context. Without this a shared Chrome leaked one session's tabs and navigation into
-  another's page list.
+#### 2. Rust - 단일 공유 데몬 + 공유 Chrome 트리 (빌드 필요)
 
-### Building the fork on Linux/macOS
+- **네임스페이스 단위 데몬 식별** (`cli/src/connection.rs`): 사이드카 파일들을 세션 대신 네임스페이스 키로 관리, 명령에 세션 소유권을 실어 단일 데몬이 라우팅.
+- **데몬 1개가 세션 N개 서빙** (`cli/src/native/daemon.rs`): `SessionMap`으로 세션별 상태 lazy 생성, 공유 `shared_browser` 슬롯으로 Chrome 1개 공유.
+- **공유 Chrome + 분리된 browser context** (`browser.rs`, `cdp/types.rs`, `actions.rs`): 세션은 자기 context의 타겋만 관찰(`target_in_context()`), 탭 유출 차단.
+- **빌드**: 릴리즈 `v0.34.0-namespace.1`에 win32-x64 기성품 포함. Linux/macOS는 `pnpm install` 후 `pnpm build:native` (Rust 필요).
 
-The fork's GitHub release (`v0.34.0-namespace.1`) currently ships only the `win32-x64` binary, so
-Windows works out of the box. On Linux/macOS, `npm run dev` inside OpenCode WebUI would fall back to
-the npm package (the upstream build, without namespace mode). To use the fork build there, build it
-from source and point the WebUI installer at the resulting asset:
-
-```bash
-# 1. Clone the fork and build the native binary
-git clone https://github.com/ckdfuf2001/agent-browser
-cd agent-browser
-pnpm install
-pnpm build:native          # requires Rust (https://rustup.rs)
-
-# 2. (Optional, recommended) Upload it as a release asset so OpenCode WebUI's
-#    installer can pick it up automatically. It reads the repository's `latest`
-#    release, which currently carries only:
-#    - agent-browser-win32-x64.exe   (Windows, already present)
-#    Build and add the missing ones (e.g. gh release upload v0.34.0-namespace.1
-#    bin/agent-browser-darwin-arm64 bin/agent-browser-darwin-x64
-#    bin/agent-browser-linux-x64 bin/agent-browser-linux-musl-x64), or create a
-#    new release with the full set so every platform resolves from the same tag.
-```
-
-When the fork release carries the matching asset, no extra step is needed: OpenCode WebUI's
-`install-agent-browser.js` downloads it automatically (override the repo with
-`AGENT_BROWSER_GITHUB_REPO`, or pin with `AGENT_BROWSER_VERSION`). Until then, you can drop the
-built binary and Chromium under the WebUI's `vendor/agent-browser/` and `vendor/chromium/` (or run
-the CLI binary directly with the README's [Sessions](#sessions) / [Namespace mode](#namespace-mode)
-examples).
 
 [![skills.sh](https://skills.sh/b/vercel-labs/agent-browser)](https://skills.sh/vercel-labs/agent-browser)
 
@@ -409,7 +365,7 @@ agent-browser window new                       # New window
 
 Tab ids are stable strings of the form `t1`, `t2`, `t3`. They're never reused within a session, so scripts and agents can keep referring to the same tab even after other tabs are opened or closed. Positional integers like `tab 2` are **not** accepted; the `t` prefix disambiguates handles from indices and mirrors the `@e1` convention used for element refs.
 
-You can also assign a memorable label (`docs`, `app`, `admin`) and use it interchangeably with the id. Labels are never auto-generated and never rewritten on navigation — they're yours to name and keep:
+You can also assign a memorable label (`docs`, `app`, `admin`) and use it interchangeably with the id. Labels are never auto-generated and never rewritten on navigation ??they're yours to name and keep:
 
 ```bash
 agent-browser tab new --label docs https://docs.example.com
@@ -523,7 +479,7 @@ agent-browser vitals [url] [--json]                # LCP/CLS/TTFB/FCP/INP + hydr
 Each `react ...` subcommand requires `--enable react-devtools` to have been passed at launch (the React DevTools `installHook.js` is embedded in the binary). Without it the commands error with `React DevTools hook not installed
 - relaunch with --enable react-devtools`.
 
-Works on any React app — Next.js, Remix, Vite+React, CRA, TanStack Start, React Native Web, etc. `vitals` and `pushstate` are framework-agnostic. `vitals` prints a summary by default; pass `--json` for the full structured payload.
+Works on any React app ??Next.js, Remix, Vite+React, CRA, TanStack Start, React Native Web, etc. `vitals` and `pushstate` are framework-agnostic. `vitals` prints a summary by default; pass `--json` for the full structured payload.
 
 ### Accessibility audits
 
@@ -605,14 +561,14 @@ The default tools profile is `core`, which keeps MCP context small for everyday 
 
 Profiles:
 
-- `core` — Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
-- `network` — Network routes, request inspection, HAR, headers, credentials, offline
-- `state` — Cookies, storage, auth, saved state, sessions, profiles, skills
-- `debug` — Console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
-- `tabs` — Back/forward/reload, tabs, windows, frames, dialogs
-- `react` — React tree/inspect/renders/suspense, vitals, pushstate
-- `mobile` — Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
-- `all` — Every MCP tool, including the full typed CLI parity surface
+- `core` ??Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
+- `network` ??Network routes, request inspection, HAR, headers, credentials, offline
+- `state` ??Cookies, storage, auth, saved state, sessions, profiles, skills
+- `debug` ??Console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
+- `tabs` ??Back/forward/reload, tabs, windows, frames, dialogs
+- `react` ??React tree/inspect/renders/suspense, vitals, pushstate
+- `mobile` ??Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
+- `all` ??Every MCP tool, including the full typed CLI parity surface
 
 Common tools include:
 
@@ -763,14 +719,14 @@ AGENT_BROWSER_NAMESPACE=opencode agent-browser mcp
 
 How it works:
 
-- **One daemon per namespace.** The daemon's sidecar files (`.pid`, `.port`, `.sock`, `.config`, `.stream`, …) are keyed by the namespace, and each request carries the `session` it belongs to. The daemon routes each request to that session's own daemon state, created lazily on first use, so sessions never share state objects.
+- **One daemon per namespace.** The daemon's sidecar files (`.pid`, `.port`, `.sock`, `.config`, `.stream`, ?? are keyed by the namespace, and each request carries the `session` it belongs to. The daemon routes each request to that session's own daemon state, created lazily on first use, so sessions never share state objects.
 - **One Chrome per namespace.** The first session to open a browser launches Chrome and publishes its WebSocket URL. Every later session attaches to that same instance and calls `Target.createBrowserContext` to get a fresh private context instead of spawning a second Chrome tree.
 - **CDP-level isolation.** A session only discovers and tracks targets whose `browserContextId` matches its own private context, so tabs, cookies, and storage can never leak between sessions that share the browser.
 
 Caveats:
 
 - A namespace daemon is shared, so daemon-level options (`--debug`, `--action-policy`, `--confirm-actions`, `--idle-timeout`, `--default-timeout`, `--no-auto-dialog`) must be identical across every command in the namespace. A mismatch stops the shared daemon for a restart, which also closes every session's browser. See [`daemon_config_fingerprint`](cli/src/connection.rs).
-- Session-level options (Chrome profile, extensions, storage state, restore, headers, …) are per-session and can differ freely.
+- Session-level options (Chrome profile, extensions, storage state, restore, headers, ?? are per-session and can differ freely.
 
 ### Tab pinning
 
@@ -1345,7 +1301,7 @@ On macOS and Windows this uses the hardware Metal/D3D backend. On Linux it route
 apt-get install -y libvulkan1 mesa-vulkan-drivers
 ```
 
-One upstream caveat: headless Chrome cannot capture WebGPU canvas presentation in screenshots on Windows and Linux (rendering and in-page readbacks work; the capture is black). Screenshots of WebGPU pages work headless on macOS; on Windows run `--headed` in a logged-in desktop session; on Linux just add `--headed` — when no `DISPLAY` is set and Xvfb is installed, agent-browser starts a private virtual display automatically (opt out with `AGENT_BROWSER_NO_XVFB=1`).
+One upstream caveat: headless Chrome cannot capture WebGPU canvas presentation in screenshots on Windows and Linux (rendering and in-page readbacks work; the capture is black). Screenshots of WebGPU pages work headless on macOS; on Windows run `--headed` in a logged-in desktop session; on Linux just add `--headed` ??when no `DISPLAY` is set and Xvfb is installed, agent-browser starts a private virtual display automatically (opt out with `AGENT_BROWSER_NO_XVFB=1`).
 
 Verify the full pipeline (adapter, render pass, and screenshot capture) with:
 
@@ -1356,7 +1312,7 @@ agent-browser doctor --webgpu
 Notes for WebGPU pages:
 
 - WebGPU only exists in secure contexts (`https://`, `http://localhost`, or `file://`).
-- three.js `WebGPURenderer` initializes asynchronously and silently falls back to WebGL2 when no adapter is available — wait for the app to render its first frame before taking a screenshot.
+- three.js `WebGPURenderer` initializes asynchronously and silently falls back to WebGL2 when no adapter is available ??wait for the app to render its first frame before taking a screenshot.
 - To prefer a real GPU on Linux instead of SwiftShader, override both the Vulkan driver and the adapter with `--args "--use-vulkan=native,--use-webgpu-adapter=default"` (user args win over the preset; `--use-webgpu-adapter` alone still enumerates only SwiftShader).
 
 See the [WebGPU docs page](https://agent-browser.dev/webgpu) for the full platform matrix and container recipe.
@@ -1443,7 +1399,7 @@ import browser from "@agent-browser/eve";
 export default browser({});
 ```
 
-This composes ~20 namespaced tools into the agent — `browser__navigate`, `browser__snapshot`, `browser__click`, `browser__fill`, `browser__find`, `browser__screenshot`, and more — all running agent-browser inside the agent's sandbox. agent-browser installs automatically on first use; pre-install it in `agent/sandbox.ts` with the `@agent-browser/eve/sandbox` helpers to bake the cost into the sandbox template instead. Configuration (domain allowlists, output limits, session naming) and per-tool overrides are covered in the [package README](packages/@agent-browser/eve/README.md), and the [eve example](examples/eve/) is a complete app with the extension mounted.
+This composes ~20 namespaced tools into the agent ??`browser__navigate`, `browser__snapshot`, `browser__click`, `browser__fill`, `browser__find`, `browser__screenshot`, and more ??all running agent-browser inside the agent's sandbox. agent-browser installs automatically on first use; pre-install it in `agent/sandbox.ts` with the `@agent-browser/eve/sandbox` helpers to bake the cost into the sandbox template instead. Configuration (domain allowlists, output limits, session naming) and per-tool overrides are covered in the [package README](packages/@agent-browser/eve/README.md), and the [eve example](examples/eve/) is a complete app with the extension mounted.
 
 ### Serverless (AWS Lambda)
 
@@ -1706,7 +1662,7 @@ Install as a Claude Code skill:
 npx skills add vercel-labs/agent-browser
 ```
 
-This adds a thin discovery stub at `.claude/skills/agent-browser/SKILL.md`. The stub is intentionally minimal — it points Claude Code at `agent-browser skills get core` to load the actual workflow content at runtime. This way the instructions always match the installed CLI version instead of going stale between releases.
+This adds a thin discovery stub at `.claude/skills/agent-browser/SKILL.md`. The stub is intentionally minimal ??it points Claude Code at `agent-browser skills get core` to load the actual workflow content at runtime. This way the instructions always match the installed CLI version instead of going stale between releases.
 
 ### AGENTS.md / CLAUDE.md
 
