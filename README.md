@@ -107,10 +107,23 @@ agent-browser.exe install
 
 긴 가이드는 `agent_browser_skills_get` (로컬 `skills/session-proxy/SKILL.md` 서빙).
 
+## 도구 일람 (36)
+
+| 그룹 | 도구 |
+|------|------|
+| 세션 | `session_ensure`, `session_cleanup`, `session_list`, `close` |
+| 탐색·조회 | `open`, `snapshot`, `read`, `get_text`, `get_url`, `get_title`, `screenshot` |
+| 입력·실행 | `click`, `fill`, `type`, `press`, `check`, `uncheck`, `select`, `scroll`, `eval` |
+| 대기 | `wait_ms`, `wait_selector`, `wait_text`, `wait_load` |
+| 히스토리 | `back`, `forward`, `reload` |
+| 탭 | `tab_new`, `tab_list`, `tab_switch`, `tab_close` |
+| 쿠키 | `cookies_get`, `cookies_set`, `cookies_clear` |
+| 가이드 | `skills_list`, `skills_get` |
+
 ## 테스트
 
 ```sh
-node test-smoke.mjs   # 가드 11종, 브라우저 불필요
+node test-smoke.mjs   # 계약 15종, 브라우저 불필요
 ```
 
 ## 알려진 이슈
@@ -133,4 +146,5 @@ node test-smoke.mjs   # 가드 11종, 브라우저 불필요
 
 ## 버전
 
-- `proxy-v2.2.0`: 네임스페이스·세션 쌍방 필수 + 재사용 확인 + 한글 + 레지스트리 저장
+- `proxy-v2.2.0` (태그): 네임스페이스·세션 쌍방 필수 + 재사용 확인 + 한글 + 레지스트리 저장
+- 브랜치 HEAD (태그 이후): 프록시 전용 스킬 동봉·로컬 서빙 (`skills/session-proxy/SKILL.md`)
