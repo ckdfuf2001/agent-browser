@@ -64,6 +64,14 @@ const ensNoNs = await req("tools/call", { name: "agent_browser_session_ensure", 
 check("ensure requires namespace", /`namespace` is REQUIRED/.test(body(ensNoNs)));
 const ensKo = await req("tools/call", { name: "agent_browser_session_ensure", arguments: { session: "결제-확인", namespace: "opencode" } });
 check("korean session accepted", /결제-확인/.test(body(ensKo)), body(ensKo));
+const skList = await req("tools/call", { name: "agent_browser_skills_list", arguments: {} });
+check("skills_list needs no scope", /proxy/.test(body(skList)), body(skList));
+const skGet = await req("tools/call", { name: "agent_browser_skills_get", arguments: {} });
+check("skills_get serves proxy guide", /Core loop/.test(body(skGet)), body(skGet).slice(0, 100));
+const skCore = await req("tools/call", { name: "agent_browser_skills_get", arguments: { name: "core" } });
+check("skills_get core maps to proxy guide", /Core loop/.test(body(skCore)));
+const skOther = await req("tools/call", { name: "agent_browser_skills_get", arguments: { name: "electron" } });
+check("skills_get unknown falls back gracefully", /unavailable on this machine/.test(body(skOther)), body(skOther).slice(0, 110));
 
 console.log(R.join("\n"));
 const fails = R.filter((r) => r.indexOf("FAIL") === 0).length;

@@ -25,7 +25,7 @@
 6. **재시작 내성**: 추적 레지스트리를 파일에 저장. opencode가 MCP를 재기동해도 추적·정리 이어감.
 7. **open 검증 폴백**: 첫 기동 멈춤을 25초로 끊고 `get_url`로 확인 후 성공 보고. LLM이 에러 루프에 안 빠짐.
 8. **한글 세션/네임스페이스**: `결제-확인` 같은 이름 허용. CLI·데몬에는 결정적 ASCII(`u`+hex)로 전달, 화면엔 원본 표시.
-9. **호출 성공률**: 도구 35개로 축소, `e12`→`@e12` 자동 교정, stale ref/tab_gone/covered/타임아웃 복구 힌트, close-all 차단.
+9. **호출 성공률**: 도구 36개로 축소, `e12`→`@e12` 자동 교정, stale ref/tab_gone/covered/타임아웃 복구 힌트, close-all 차단, `skills_get`이 프록시 전용 가이드(`skills/session-proxy/SKILL.md`)를 로컬 서빙 (CLI 스킬 번들 불필요).
 
 ## 구조
 
@@ -99,11 +99,13 @@ agent-browser.exe install
 
 ```
 1. agent_browser_session_ensure { namespace: "opencode", task: "checkout" }
-   → "session ready: checkout-a1b2c3"  (이미 있으면 EXISTS+탭목록 → reuse:true 로 확정)
+   → "session ready: \"checkout-a1b2c3\""  (이미 있으면 EXISTS+탭목록 → reuse:true 로 확정)
 2. 이후 모든 호출에 { namespace: "opencode", session: "checkout-a1b2c3" } 동반
 3. open → snapshot → click/fill (새 @ref) → snapshot …
 4. 끝나면 agent_browser_close (또는 방치하면 TTL 정리)
 ```
+
+긴 가이드는 `agent_browser_skills_get` (로컬 `skills/session-proxy/SKILL.md` 서빙).
 
 ## 테스트
 
@@ -123,6 +125,7 @@ node test-smoke.mjs   # 가드 11종, 브라우저 불필요
 | 파일 | 설명 |
 |------|------|
 | `mcp-server.mjs` | 프록시 본체 (의존성 없음) |
+| `skills/session-proxy/SKILL.md` | LLM용 사용 가이드 (`skills_get`이 로컬 서빙, upstream CLI 스킬과 달리 프록시 규칙 반영) |
 | `opencode.json` | MCP 연결 설정 예시 |
 | `package.json` | `npm test` (= test-smoke) |
 | `test-smoke.mjs` | 계약 테스트 |

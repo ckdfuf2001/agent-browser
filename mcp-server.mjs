@@ -28,6 +28,8 @@ import { spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import os from "node:os";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+const SKILL_PATH = fileURLToPath(new URL("./skills/session-proxy/SKILL.md", import.meta.url));
 
 const argv = process.argv.slice(2);
 const flag = (n) => {
@@ -298,10 +300,14 @@ const TOOLS = [
     build: (a) => ["cookies", "set", a.name, a.value, ...(a.domain ? ["--domain", a.domain] : [])] },
   { name: "agent_browser_cookies_clear", title: "Clear cookies", needSession: true, description: "Clear the session's cookies.",
     schema: { timeoutMs: TMO }, build: () => ["cookies", "clear"] },
-  { name: "agent_browser_skills_get", title: "Get skill guide", needSession: false,
-    description: "Load the version-matched usage guide (\"core\" first when unsure). Prefer this over guessing commands.",
-    schema: { name: { type: "string", description: "Skill name (default \"core\")." } },
-    build: (a) => ["skills", "get", a.name || "core"] },
+  { name: "agent_browser_skills_list", title: "List skill guides", needSession: false, local: true,
+    description: "List available usage guides. Start with \"proxy\" before any browser task.",
+    schema: {},
+    build: () => [] },
+  { name: "agent_browser_skills_get", title: "Get skill guide", needSession: false, local: true,
+    description: "Load the proxy usage guide (\"proxy\": scope rules, ensure/reuse flow, snapshot loop, troubleshooting). Call this before guessing. Other names fall back to the CLI bundles when installed.",
+    schema: { name: { type: "string", description: "Guide name (default \"proxy\")." } },
+    build: () => [] },
   { name: "agent_browser_session_ensure", title: "Ensure session", needSession: false, local: true,
     description: "Mint/validate an isolated session name in a namespace. Call ONCE per task, reuse the same namespace+session for every call. Idle sessions auto-close after TTL.",
     schema: { task: { type: "string", description: "Short slug, e.g. \"checkout\"." }, session: { type: "string" }, reuse: { type: "boolean", description: "Pass true ONLY to adopt a live session the EXISTS report showed you (confirms it is YOUR browser)." } } },
@@ -398,6 +404,29 @@ async function onCall(name, rawArgs, id) {
   const def = BY_NAME.get(name);
   if (!def) return send({ jsonrpc: "2.0", id, error: { code: -32601, message: "Unknown tool: " + name } });
   const a = (rawArgs && typeof rawArgs === "object") ? Object.assign({}, rawArgs) : {};
+
+  // Docs need no scope: usable before ensure, never touches a browser.
+  if (name === "agent_browser_skills_list") {
+    return send({ jsonrpc: "2.0", id, result: txt(
+      "Available guides:\n" +
+      "- proxy (default): session-isolated workflow for THIS server (scope rules, ensure/reuse, snapshot loop, troubleshooting). Call agent_browser_skills_get first.\n" +
+      "- <cli names> (electron, slack, core, …): forwarded to `agent-browser skills get` when the CLI bundle exists on this machine.") });
+  }
+  if (name === "agent_browser_skills_get") {
+    const n = String(a.name || "proxy").trim() || "proxy";
+    if (n === "proxy" || n === "session-proxy" || n === "core") {
+      try {
+        return send({ jsonrpc: "2.0", id, result: txt(fs.readFileSync(SKILL_PATH, "utf8").slice(0, 12000)) });
+      } catch (e) {
+        return send({ jsonrpc: "2.0", id, result: txt("Proxy guide file missing next to mcp-server.mjs: " + SKILL_PATH, true) });
+      }
+    }
+    const r = await runCli(["skills", "get", n], 15000);
+    const out = (r.out || r.err || "").trim();
+    if (r.code !== 0 || !out)
+      return send({ jsonrpc: "2.0", id, result: txt("CLI skill \"" + n + "\" is unavailable on this machine. Use agent_browser_skills_get {\"name\":\"proxy\"} instead.", true) });
+    return send({ jsonrpc: "2.0", id, result: txt(out.slice(0, 12000)) });
+  }
 
   // Scope is explicit on EVERY call: namespace is REQUIRED (single-daemon
   // pinned value) and session identifies the task browser. At least one must
@@ -521,7 +550,7 @@ async function onMessage(m) {
       protocolVersion: params.protocolVersion || PROTOCOL,
       capabilities: { tools: {} },
       serverInfo: { name: "agent-browser-session-proxy", title: "agent-browser (session-safe)", version: "2.2.0" },
-      instructions: "Session-isolated browser on ONE shared daemon. Concurrent tasks MUST use different sessions (call agent_browser_session_ensure first). Flow per task: open -> snapshot -> interact with fresh @refs. Idle sessions auto-close; in-flight work is never interrupted.",
+      instructions: "Session-isolated browser on ONE shared daemon. Read agent_browser_skills_get (guide proxy) before the first browser task. Concurrent tasks MUST use different sessions (call agent_browser_session_ensure first). Flow per task: open -> snapshot -> interact with fresh @refs. Idle sessions auto-close; in-flight work is never interrupted.",
     } });
     if (typeof method === "string" && method.indexOf("notifications/") === 0) return;
     if (method === "ping") return send({ jsonrpc: "2.0", id, result: {} });
