@@ -43,7 +43,24 @@ agent-browser daemon ×1 ── 브라우저 ×N (세션당 1개)
 
 ## 설치·설정
 
-`opencode.json`의 MCP를 프록시로 지정:
+바이너리는 릴리즈에서 바로 받으세요 (빌드 불필요):
+https://github.com/ckdfuf2001/agent-browser/releases/tag/proxy-v2.2.0
+
+| 에셋 | 내용 |
+|------|------|
+| `agent-browser-proxy-v2.2.0.zip` | 프록시+설정+테스트+문서 (압축 풀고 node로 바로 실행) |
+| `agent-browser-win32-x64-0.33.2.zip` | 검증된 agent-browser 바이너리 (Windows x64, 설치 불필요) |
+
+다른 머신 빠른 시작:
+
+```sh
+# 1. 위 2개 압축 해제, Node 18+ 준비
+# 2. Chrome 받기 (최초 1회, ~400MB)
+agent-browser.exe install
+# 3. opencode.json 경로 지정
+```
+
+`opencode.json`의 MCP를 프록시로 지정 (`--cli`와 크롬 경로만 그 머신에 맞게):
 
 ```json
 {
@@ -51,7 +68,7 @@ agent-browser daemon ×1 ── 브라우저 ×N (세션당 1개)
     "agent-browser": {
       "type": "local",
       "enabled": true,
-      "command": ["node", "mcp-server.mjs", "--tools", "core,tabs,state",
+      "command": ["node", "<압축해제경로>/mcp-server.mjs",
         "--cli", "<agent-browser.exe 절대경로>", "--namespace", "opencode"],
       "env": {
         "AGENT_BROWSER_EXECUTABLE_PATH": "<chromium chrome.exe 절대경로>",
