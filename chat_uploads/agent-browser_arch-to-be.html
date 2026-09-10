@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-browser Session Proxy — 아키텍처 (to-be)</title>
+<style>
+  :root{
+    --keep:#3b82f6; --keep-bg:#eff6ff; --keep-br:#bfdbfe;
+    --mod:#f59e0b;  --mod-bg:#fffbeb;  --mod-br:#fde68a;
+    --new:#ec4899;  --new-bg:#fdf2f8;  --new-br:#fbcfe8;
+    --git:#10b981;  --git-bg:#ecfdf5;  --git-br:#a7f3d0;
+    --ink:#1f2937; --mute:#6b7280; --line:#e5e7eb; --bg:#f9fafb;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:40px 24px;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans KR",sans-serif;
+       line-height:1.7;font-size:15px}
+  .wrap{max-width:1100px;margin:0 auto}
+  h1{font-size:28px;margin:0 0 6px;letter-spacing:-.5px}
+  .sub{color:var(--mute);margin:0 0 28px;font-size:14px}
+  h2{font-size:20px;margin:44px 0 14px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:16px;margin:26px 0 10px;color:#374151}
+  p{margin:10px 0}
+  code{background:#f3f4f6;padding:1px 5px;border-radius:4px;
+       font-family:"SF Mono",Consolas,monospace;font-size:13px}
+  pre{background:#111827;color:#e5e7eb;padding:18px 20px;border-radius:10px;
+      overflow-x:auto;font-family:"SF Mono",Consolas,monospace;font-size:12.5px;line-height:1.6}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px;background:#fff}
+  th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+  th{background:#f3f4f6;font-weight:600}
+  .legend{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 8px}
+  .lg{display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border-radius:8px;
+      font-size:13px;font-weight:600;border:1px solid}
+  .dot{width:11px;height:11px;border-radius:50%;display:inline-block}
+  .lg.keep{background:var(--keep-bg);border-color:var(--keep-br);color:#1e40af}
+  .lg.mod{background:var(--mod-bg);border-color:var(--mod-br);color:#92400e}
+  .lg.new{background:var(--new-bg);border-color:var(--new-br);color:#9d174d}
+  .b{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11.5px;
+     font-weight:700;white-space:nowrap;border:1px solid}
+  .b.keep{background:var(--keep-bg);border-color:var(--keep-br);color:#1e40af}
+  .b.mod{background:var(--mod-bg);border-color:var(--mod-br);color:#92400e}
+  .b.new{background:var(--new-bg);border-color:var(--new-br);color:#9d174d}
+  .note{border-left:4px solid var(--mod);background:var(--mod-bg);
+        padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0;font-size:14px}
+  .warn{border-left:4px solid #ef4444;background:#fef2f2;
+        padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0;font-size:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px;margin:16px 0}
+  .card{border:1px solid var(--line);border-radius:10px;padding:14px 16px;background:#fff}
+  .card.new{border-left:4px solid var(--new)}
+  .card.mod{border-left:4px solid var(--mod)}
+  .card h4{margin:0 0 6px;font-size:14.5px}
+  .card p{margin:0;font-size:13px;color:#4b5563}
+  .diag{background:#fff;border:1px solid var(--line);border-radius:10px;padding:20px;
+        overflow-x:auto;font-family:"SF Mono",Consolas,monospace;font-size:12px;
+        line-height:1.65;white-space:pre}
+  .kb{color:var(--keep);font-weight:600}
+  .mb{color:var(--mod);font-weight:600}
+  .nb{color:var(--new);font-weight:600}
+  .mute{color:var(--mute)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>agent-browser Session Proxy — 아키텍처</h1>
+<p class="sub">to-be · 브랜치 <code>proxy/session-isolation</code> · 태그 <code>proxy-v2.2.0</code> · upstream <code>vercel-labs/agent-browser</code> 대비 변경 문서</p>
+
+<div class="legend">
+  <span class="lg keep"><span class="dot" style="background:var(--keep)"></span>기존 유지 (upstream 바이너리·데몬)</span>
+  <span class="lg mod"><span class="dot" style="background:var(--mod)"></span>기존 설정 수정</span>
+  <span class="lg new"><span class="dot" style="background:var(--new)"></span>신규 (프록시)</span>
+</div>
+
+<h2>0. 설계 원칙</h2>
+<p>세 가지가 이 문서 전체를 관통합니다.</p>
+<p><strong>데몬은 정확히 1개, 격리 단위는 세션이다.</strong> agent-browser는 네임스페이스마다 데몬을 띄우므로, 네임스페이스를 서버 핀 1개로 고정합니다. 그 아래 작업마다 별도 Chrome(세션당 1개)이 붙고, 동시 호출은 서로의 탭/ref를 절대 건드릴 수 없습니다.</p>
+<p><strong>익명 호출을 금지한다.</strong> 매 호출마다 <code>namespace</code>+<code>session</code>을 명시하게 하고, 등록되지 않은 쌍은 실행하지 않습니다. 남의 live 브라우저에 몰래 붙는 일을 구조적으로 차단합니다.</p>
+<p><strong>돌아가는 것은 건드리지 않는다.</strong> 스위퍼·LRU는 in-flight 호출이 있는 세션을 절대 닫거나 퇴출하지 않습니다. 정리는 idle 세션에만 일어납니다.</p>
+
+<h2>1. 프로세스 토폴로지</h2>
+<div class="diag"><span class="kb">opencode (MCP client, stdio)</span>  ── tools/list · tools/call (35 tools, JSON-RPC)
+         │
+         ▼
+<span class="nb">mcp-server.mjs (proxy, node, 의존성 0)</span>  ── 레지스트리: ns+session → lastSeen/inFlight
+         │                                    │  └─ 파일 저장 (재시작 내성, TTL 만료분 제외)
+         │  호출마다: 명시 검증 → ensure 확인 → CLI 단발 실행 → 결과 반환 (무상태)
+         ▼
+<span class="kb">agent-browser CLI</span>  --namespace opencode --session &lt;S&gt; &lt;cmd&gt; --json  (호출당 1프로세스)
+         ▼
+<span class="kb">agent-browser daemon ×1</span>  ── 데몬 1개가 전부 관리 (idle 15분이면 스스로 종료)
+         │
+         ├─ <span class="kb">Chrome (session: task-A)</span>   작업 A 전용
+         ├─ <span class="kb">Chrome (session: task-B)</span>   작업 B 전용 (A와 간섭 불가)
+         └─ <span class="kb">Chrome (session: repo-aa …)</span> 기존 세션과 동거 가능</div>
+
+<div class="note">
+<strong>핵심 제약:</strong> 프록시는 브라우저를 직접 소유하지 않습니다. 브라우저 생명주기의 진실의 원천은 agent-browser 데몬이며, 프록시는 <em>호출 게이트 + 추적 + 정리</em>만 담당합니다. 이 비대칭 덕분에 프록시가 죽거나 재시작돼도 실행 중인 브라우저는 영향받지 않고, 레지스트리 파일로 추적을 복원합니다.
+</div>
+
+<h2>2. 세션 생명주기</h2>
+<div class="diag">ensure (신규) ──▶ tracked ──▶ open/snapshot/click… (inFlight 카운트)
+                        │                    │
+                        │                    ├─ 종료 시: close → untracked + 브라우저 종료
+                        │                    └─ 방치 시: TTL(10분) → sweeper가 close
+                        │
+ensure (live 존재) ──▶ EXISTS + 탭 목록 ──▶ reuse:true ──▶ tracked (adopt)
+                                            └─ 다른 이름 ──▶ 신규로 시작</div>
+
+<div class="warn">
+<strong>확인 규칙:</strong> 데몬에 live 세션이 있는데 레지스트리에 없으면(프록시 재시작, 타 작업 소유) <code>EXISTS</code> 보고 + 탭 목록을 먼저 보여주고 <code>reuse:true</code> 확정 없이는 진입하지 않습니다. 미등록 쌍으로 도구를 직접 호출하면 <code>ensure</code>로 유도됩니다.
+</div>
+
+<h2>3. 호출 흐름 (도구 1회)</h2>
+<pre>1. namespace 필수 확인 (핀값과 다르면 거부 + 안내)
+2. session 필수·형식 확인 (한글 허용, default 거부)
+3. needSession 도구: 레지스트리 등록 여부 확인 (미등록 → ensure 유도)
+4. selector 자동 교정 (e12 → @e12)
+5. CLI 단발 실행 (--namespace/--session/--idle-timeout 15m/--json, 타임아웃+kill)
+   └ open 한정: 25초 초과 시 get_url로 검증 후 성공 보고 (콜드 기동 hang 흡수)
+6. 실패 시 복구 힌트 첨부 (stale ref / tab_gone / covered / timeout)
+7. inFlight 증감 + lastSeen 갱신 (finally 보장)</pre>
+
+<h2>4. 한글 이름 인코딩</h2>
+<p>CLI·데몬은 소켓/경로 제약상 ASCII만 받습니다. 프록시는 사용자 표시명과 CLI 전달명을 분리합니다.</p>
+<table>
+<thead><tr><th>구분</th><th>규칙</th><th>예</th></tr></thead>
+<tbody>
+<tr><td>사용자 입력 검증</td><td>유니코드 문자·숫자·<code>-_</code>, 최대 64자</td><td><code>결제-확인</code> <span class="b new">허용</span></td></tr>
+<tr><td>ASCII 통과</td><td>그대로 전달 (가독성 유지)</td><td><code>repo-aa</code> → <code>repo-aa</code></td></tr>
+<tr><td>비ASCII 인코딩</td><td><code>u</code> + UTF-8 hex (초과 시 sha256 축약), 결정적</td><td><code>결제-확인</code> → <code>uebb2b0…ec9db8</code></td></tr>
+<tr><td>표시 역변환</td><td>레지스트리·저장 파일의 원본명으로 표시, session_list에 매핑注記</td><td><code>u… = "결제-확인"</code></td></tr>
+</tbody>
+</table>
+
+<h2>5. upstream 대비 변경 대조표</h2>
+<table>
+<thead><tr><th style="width:22%">항목</th><th style="width:38%">upstream 그대로</th><th style="width:40%">본 프록시</th></tr></thead>
+<tbody>
+<tr><td>연결 방식</td><td><code>agent-browser mcp</code> 상주 서버 (62 tools)</td><td>호출당 CLI 단발 실행, 35 tools <span class="b new">NEW</span></td></tr>
+<tr><td>세션 지정</td><td>선택사항 (생략 시 공유·충돌)</td><td>매 호출 필수, <code>default</code> 거부 <span class="b new">NEW</span></td></tr>
+<tr><td>네임스페이스</td><td>호출마다 임의 (데몬 분기)</td><td>서버 핀 1개, 상이값 거부 <span class="b new">NEW</span></td></tr>
+<tr><td>재사용 확인</td><td>없음 (그냥 붙음)</td><td>EXISTS+탭목록 → <code>reuse:true</code> 확정 <span class="b new">NEW</span></td></tr>
+<tr><td>idle 정리</td><td>없음 (장시간 방치)</td><td>TTL 10분 + LRU + in-flight 보호 <span class="b new">NEW</span></td></tr>
+<tr><td>재시작 내성</td><td>메모리 상태 소실</td><td>레지스트리 파일 저장·복원 <span class="b new">NEW</span></td></tr>
+<tr><td>첫 open hang</td><td>무응답 (브라우저만 뜸)</td><td>25초 bound + get_url 검증 후 성공 보고 <span class="b new">NEW</span></td></tr>
+<tr><td>한글 이름</td><td>불가 (ASCII만)</td><td>허용 + 결정적 인코딩 <span class="b new">NEW</span></td></tr>
+<tr><td>LLM 실수 대응</td><td>없음</td><td>셀렉터 교정·복구 힌트·close-all 차단 <span class="b new">NEW</span></td></tr>
+<tr><td>브라우저·데몬</td><td colspan="2">upstream 바이너리 그대로 사용 <span class="b keep">KEEP</span></td></tr>
+<tr><td>opencode.json</td><td>바이너리 직결 + SESSION 고정</td><td>프록시 경유 + 고정 SESSION 제거 <span class="b mod">MOD</span></td></tr>
+</tbody>
+</table>
+
+<h2>6. 파일 일람</h2>
+<div class="grid">
+  <div class="card new"><h4>mcp-server.mjs <span class="b new">NEW</span></h4><p>프록시 본체. 게이트·실행·스위퍼·인코딩 전부 포함, 의존성 0.</p></div>
+  <div class="card mod"><h4>opencode.json <span class="b mod">MOD</span></h4><p>MCP 연결을 프록시로 변경. 고정 SESSION 제거, TTL/상한 env 추가.</p></div>
+  <div class="card new"><h4>test-smoke.mjs <span class="b new">NEW</span></h4><p>계약 테스트 11종 (가드·한글, 브라우저 불필요).</p></div>
+  <div class="card new"><h4>package.json <span class="b new">NEW</span></h4><p><code>npm test</code> 배선.</p></div>
+</div>
+
+<h2>7. 운영 파라미터</h2>
+<table>
+<thead><tr><th>변수</th><th>기본값</th><th>의미</th></tr></thead>
+<tbody>
+<tr><td><code>AGENT_BROWSER_NAMESPACE</code></td><td><code>opencode</code></td><td>핀 네임스페이스 (데몬 1개)</td></tr>
+<tr><td><code>AGENT_BROWSER_IDLE_TIMEOUT_MS</code></td><td><code>900000</code></td><td>데몬 idle 종료 15분</td></tr>
+<tr><td><code>SESSION_TTL_MS</code></td><td><code>600000</code></td><td>세션 idle 정리 10분</td></tr>
+<tr><td><code>SESSION_MAX</code></td><td><code>16</code></td><td>추적 상한 (idle만 LRU)</td></tr>
+<tr><td><code>SESSION_SWEEP_MS</code></td><td><code>60000</code></td><td>스위퍼 주기</td></tr>
+<tr><td><code>CALL_TIMEOUT_MS</code></td><td><code>60000</code></td><td>호출 타임아웃</td></tr>
+<tr><td><code>SESSION_STORE</code></td><td>OS tmp</td><td>레지스트리 저장 경로</td></tr>
+</tbody>
+</table>
+
+<h2>8. 알려진 이슈</h2>
+<div class="note">
+<strong>세션당 첫 open 최대 ~35초:</strong> 브라우저 첫 기동 시 upstream <code>open</code>이 반환하지 않는 문제로, 프록시가 검증 후 성공 보고로 흡수합니다. 이후 호출은 1~2초입니다.<br>
+<strong>닫힌 세션명 잔류:</strong> <code>session list</code>에 닫힌 이름이 남을 수 있으나 upstream 기록 유지 동작이며, 브라우저 프로세스는 정리됩니다.
+</div>
+
+</div>
+</body>
+</html>

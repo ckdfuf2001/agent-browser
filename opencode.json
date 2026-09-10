@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "agent-browser": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "C:\\Users\\oh\\Downloads\\opencode-webui-portable-0.3.14-win-x64\\bin\\agent-browser\\bin\\agent-browser.exe",
+        "mcp",
+        "--namespace",
+        "opencode"
+      ],
+      "env": {
+        "AGENT_BROWSER_EXECUTABLE_PATH": "C:\\Users\\oh\\Downloads\\opencode-webui-portable-0.3.14-win-x64\\bin\\agent-browser\\chromium\\chrome-win64\\chrome.exe",
+        "AGENT_BROWSER_NAMESPACE": "opencode",
+        "AGENT_BROWSER_SESSION": "repo-agent-browser",
+        "AGENT_BROWSER_IDLE_TIMEOUT_MS": "86400000",
+        "AGENT_BROWSER_AUTO_SESSION": "1"
+      }
+    }
+  }
+}

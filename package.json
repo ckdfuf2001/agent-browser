@@ -1,0 +1,14 @@
+{
+  "name": "agent-browser-session-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Session-isolating MCP proxy in front of agent-browser (TTL sweep, LRU cap, LLM-friendly guards). No dependencies.",
+  "scripts": {
+    "start": "node mcp-server.mjs --tools core,tabs,state",
+    "test": "node test-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
