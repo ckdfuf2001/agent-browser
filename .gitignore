@@ -4,3 +4,6 @@ session-store.json
 shots/
 *.png
 *.webm
+# webui upload drop zone (keep only our arch doc)
+chat_uploads/*
+!chat_uploads/agent-browser_arch-to-be.html
